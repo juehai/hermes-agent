@@ -81,9 +81,7 @@ export function ToolPart(props: { part: ToolPartState }) {
   const collapsible = () => !running() && (lines().length > 1 || showArgs())
   // Header subtitle: the primary-arg preview (item 2), else explicit summary, else first line.
   const subtitle = () =>
-    props.part.error
-      ? `✗ ${props.part.error}`
-      : props.part.argsPreview || props.part.summary || lines()[0] || ''
+    props.part.error ? `✗ ${props.part.error}` : props.part.argsPreview || props.part.summary || lines()[0] || ''
   const body = createMemo(() => collapseToolOutput(result(), EXPANDED_MAX, bodyWidth() - 2))
 
   const headGlyph = () => (collapsible() ? (expanded() ? '▼' : '▶') : '⚡')

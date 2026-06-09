@@ -104,7 +104,10 @@ export class RawGatewayClient {
     // A recovery-respawn re-enters start(), so this re-arms per respawn — desired.
     this.startupTimer = setTimeout(() => {
       this.startupTimer = undefined
-      this.onEvent({ type: 'gateway.start_timeout', payload: { message: `no gateway.ready within ${STARTUP_TIMEOUT_MS}ms` } })
+      this.onEvent({
+        type: 'gateway.start_timeout',
+        payload: { message: `no gateway.ready within ${STARTUP_TIMEOUT_MS}ms` }
+      })
     }, STARTUP_TIMEOUT_MS)
   }
 

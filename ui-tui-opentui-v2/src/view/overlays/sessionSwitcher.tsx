@@ -19,7 +19,10 @@ export function SessionSwitcher(props: {
   const theme = useTheme()
   let rootRef: BoxRenderable | undefined
   // Native select handles ↑↓/Enter; the keymap owns Esc/Ctrl+C close.
-  useCloseLayer(() => rootRef, () => props.onClose())
+  useCloseLayer(
+    () => rootRef,
+    () => props.onClose()
+  )
 
   const options = createMemo(() =>
     props.sessions.map(s => ({

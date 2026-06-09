@@ -28,7 +28,12 @@ function withKeymap(node: () => JSX.Element): () => JSX.Element {
   return () => {
     const renderer = useRenderer()
     const keymap = createMemo(() => createDefaultOpenTuiKeymap(renderer))
-    return KeymapProvider({ keymap: keymap(), get children() { return node() } })
+    return KeymapProvider({
+      keymap: keymap(),
+      get children() {
+        return node()
+      }
+    })
   }
 }
 

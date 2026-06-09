@@ -26,7 +26,10 @@ export function ApprovalPrompt(props: {
   let rootRef: BoxRenderable | undefined
   // Native select handles ↑↓/j/k/Enter over the options; the keymap owns the
   // Esc/Ctrl+C → deny cancel path the select doesn't cover.
-  useCloseLayer(() => rootRef, () => props.onCancel())
+  useCloseLayer(
+    () => rootRef,
+    () => props.onCancel()
+  )
 
   return (
     <box

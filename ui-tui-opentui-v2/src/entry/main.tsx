@@ -244,7 +244,9 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
           gateway
             .request('session.interrupt', { session_id: sid })
             .pipe(
-              Effect.catchCause(cause => Effect.sync(() => getLog().warn('interrupt', 'failed', { cause: String(cause) })))
+              Effect.catchCause(cause =>
+                Effect.sync(() => getLog().warn('interrupt', 'failed', { cause: String(cause) }))
+              )
             )
         )
       }
@@ -292,7 +294,11 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
           }
           try {
             await Effect.runPromise(
-              gateway.request('image.attach_bytes', { content_base64: img.data, filename: 'pasted.png', session_id: sid })
+              gateway.request('image.attach_bytes', {
+                content_base64: img.data,
+                filename: 'pasted.png',
+                session_id: sid
+              })
             )
             flashHint('🖼 image attached — type a message and send', 3000)
           } catch {

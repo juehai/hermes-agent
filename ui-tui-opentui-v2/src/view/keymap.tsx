@@ -18,7 +18,14 @@ import { useBindings } from '@opentui/keymap/solid'
 export function useCloseLayer(target: () => BoxRenderable | undefined, onClose: () => void): void {
   useBindings<BoxRenderable>(() => ({
     target,
-    commands: [{ name: 'close', run() { onClose() } }],
+    commands: [
+      {
+        name: 'close',
+        run() {
+          onClose()
+        }
+      }
+    ],
     bindings: [
       { key: 'escape', cmd: 'close' },
       { key: { name: 'c', ctrl: true }, cmd: 'close' }

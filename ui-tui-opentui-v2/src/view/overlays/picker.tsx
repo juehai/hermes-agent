@@ -20,7 +20,10 @@ export function Picker(props: {
   const theme = useTheme()
   let rootRef: BoxRenderable | undefined
   // Native select handles ↑↓/j/k/Enter; the keymap owns Esc/Ctrl+C close.
-  useCloseLayer(() => rootRef, () => props.onClose())
+  useCloseLayer(
+    () => rootRef,
+    () => props.onClose()
+  )
 
   const options = createMemo(() =>
     props.items.map(it => ({ description: it.description ?? '', name: it.label, value: it.value }))

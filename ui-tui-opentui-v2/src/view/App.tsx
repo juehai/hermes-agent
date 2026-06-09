@@ -68,75 +68,75 @@ export function App(props: AppProps) {
 
   return (
     <DimensionsProvider>
-    <box style={{ flexDirection: 'column', flexGrow: 1, paddingTop: 1, paddingLeft: 1, paddingRight: 1 }}>
-      {/* a bottom rule under the header bookends the transcript with the status
+      <box style={{ flexDirection: 'column', flexGrow: 1, paddingTop: 1, paddingLeft: 1, paddingRight: 1 }}>
+        {/* a bottom rule under the header bookends the transcript with the status
           bar's top rule — frames the chrome as intentional (item 8). */}
-      <box border={['bottom']} borderColor={theme().color.border} style={{ flexShrink: 0 }}>
-        <Header store={props.store} />
-      </box>
-      {/* content zone: a full-screen overlay (pager / agents dashboard) OR the transcript + input zone */}
-      <Switch
-        fallback={
-          <>
-            <Transcript store={props.store} />
-            {/* transient busy face floats at the bottom of the transcript area */}
-            <StatusLine store={props.store} />
-            {/* input region — a top-edge rule separates the status bar + textbox from the
+        <box border={['bottom']} borderColor={theme().color.border} style={{ flexShrink: 0 }}>
+          <Header store={props.store} />
+        </box>
+        {/* content zone: a full-screen overlay (pager / agents dashboard) OR the transcript + input zone */}
+        <Switch
+          fallback={
+            <>
+              <Transcript store={props.store} />
+              {/* transient busy face floats at the bottom of the transcript area */}
+              <StatusLine store={props.store} />
+              {/* input region — a top-edge rule separates the status bar + textbox from the
                 transcript above; the status bar sits directly ABOVE the composer (item 14). */}
-            <box
-              border={['top']}
-              borderColor={theme().color.border}
-              style={{ flexShrink: 0, flexDirection: 'column' }}
-            >
-              <StatusBar store={props.store} />
-              <Switch
-                fallback={
-                  <Composer
-                    onSubmit={props.onSubmit ?? NOOP}
-                    onType={props.onType}
-                    completions={() => props.store.state.completions ?? []}
-                    completionFrom={() => props.store.state.completionFrom}
-                    onDismiss={() => props.store.clearCompletions()}
-                    history={props.history}
-                    onImagePaste={props.onImagePaste}
-                    pasteStore={props.pasteStore}
-                  />
-                }
+              <box
+                border={['top']}
+                borderColor={theme().color.border}
+                style={{ flexShrink: 0, flexDirection: 'column' }}
               >
-                <Match when={blocked()}>
-                  <PromptOverlay
-                    store={props.store}
-                    onRespond={props.onRespond ?? NOOP_RESPOND}
-                    sessionId={props.sessionId ?? NO_SESSION}
-                  />
-                </Match>
-                <Match when={switcher()}>
-                  {sessions => <SessionSwitcher sessions={sessions()} onPick={resume} onClose={closeSwitcher} />}
-                </Match>
-                <Match when={picker()}>
-                  {p => (
-                    <Picker
-                      title={p().title}
-                      items={p().items}
-                      onPick={value => {
-                        p().onPick(value)
-                        closePicker()
-                      }}
-                      onClose={closePicker}
+                <StatusBar store={props.store} />
+                <Switch
+                  fallback={
+                    <Composer
+                      onSubmit={props.onSubmit ?? NOOP}
+                      onType={props.onType}
+                      completions={() => props.store.state.completions ?? []}
+                      completionFrom={() => props.store.state.completionFrom}
+                      onDismiss={() => props.store.clearCompletions()}
+                      history={props.history}
+                      onImagePaste={props.onImagePaste}
+                      pasteStore={props.pasteStore}
                     />
-                  )}
-                </Match>
-              </Switch>
-            </box>
-          </>
-        }
-      >
-        <Match when={pager()}>{p => <Pager title={p().title} text={p().text} onClose={closePager} />}</Match>
-        <Match when={dashboard()}>
-          <AgentsDashboard subagents={props.store.state.subagents} onClose={closeDashboard} />
-        </Match>
-      </Switch>
-    </box>
+                  }
+                >
+                  <Match when={blocked()}>
+                    <PromptOverlay
+                      store={props.store}
+                      onRespond={props.onRespond ?? NOOP_RESPOND}
+                      sessionId={props.sessionId ?? NO_SESSION}
+                    />
+                  </Match>
+                  <Match when={switcher()}>
+                    {sessions => <SessionSwitcher sessions={sessions()} onPick={resume} onClose={closeSwitcher} />}
+                  </Match>
+                  <Match when={picker()}>
+                    {p => (
+                      <Picker
+                        title={p().title}
+                        items={p().items}
+                        onPick={value => {
+                          p().onPick(value)
+                          closePicker()
+                        }}
+                        onClose={closePicker}
+                      />
+                    )}
+                  </Match>
+                </Switch>
+              </box>
+            </>
+          }
+        >
+          <Match when={pager()}>{p => <Pager title={p().title} text={p().text} onClose={closePager} />}</Match>
+          <Match when={dashboard()}>
+            <AgentsDashboard subagents={props.store.state.subagents} onClose={closeDashboard} />
+          </Match>
+        </Switch>
+      </box>
     </DimensionsProvider>
   )
 }

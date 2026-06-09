@@ -782,8 +782,18 @@ export function createSessionStore() {
     const mcp = obj(root.mcp)
     setState('catalog', {
       mcp: { servers: strs(mcp.servers) },
-      skills: { categories: list(skills.categories).map(pair).filter(p => p.name), total: num(skills.total) },
-      tools: { toolsets: list(tools.toolsets).map(toolset).filter(p => p.name), total: num(tools.total) }
+      skills: {
+        categories: list(skills.categories)
+          .map(pair)
+          .filter(p => p.name),
+        total: num(skills.total)
+      },
+      tools: {
+        toolsets: list(tools.toolsets)
+          .map(toolset)
+          .filter(p => p.name),
+        total: num(tools.total)
+      }
     })
   }
 

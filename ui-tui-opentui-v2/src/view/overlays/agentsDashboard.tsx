@@ -39,7 +39,10 @@ export function AgentsDashboard(props: { subagents: SubagentInfo[]; onClose: () 
   // Close (Esc/Ctrl+C) is the native keymap; select + scroll stay in the raw global
   // handler below. Focus the root box on mount so the focus-within close layer is active.
   onMount(() => rootRef?.focus())
-  useCloseLayer(() => rootRef, () => props.onClose())
+  useCloseLayer(
+    () => rootRef,
+    () => props.onClose()
+  )
 
   useKeyboard(key => {
     // `q` closes (footer advertises "Esc/q close"); Esc/Ctrl+C close via the keymap.
@@ -107,7 +110,12 @@ export function AgentsDashboard(props: { subagents: SubagentInfo[]; onClose: () 
                 </box>
               </Show>
               <box style={{ flexGrow: 1, minHeight: 0, paddingLeft: 1 }}>
-                <scrollbox ref={el => (traceBox = el)} style={{ flexGrow: 1, minHeight: 0 }} stickyScroll stickyStart="bottom">
+                <scrollbox
+                  ref={el => (traceBox = el)}
+                  style={{ flexGrow: 1, minHeight: 0 }}
+                  stickyScroll
+                  stickyStart="bottom"
+                >
                   <Show
                     when={(sa().trace?.length ?? 0) > 0}
                     fallback={<text fg={theme().color.muted}>(no activity yet)</text>}

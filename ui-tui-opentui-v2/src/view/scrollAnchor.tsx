@@ -20,7 +20,10 @@ type AnchorFn = (toggle: () => void) => void
 
 const Ctx = createContext<AnchorFn>()
 
-export function ScrollAnchorProvider(props: { scroll: Accessor<ScrollBoxRenderable | undefined>; children: JSX.Element }) {
+export function ScrollAnchorProvider(props: {
+  scroll: Accessor<ScrollBoxRenderable | undefined>
+  children: JSX.Element
+}) {
   const around: AnchorFn = toggle => {
     const sb = props.scroll()
     if (!sb) {

@@ -40,7 +40,11 @@ export function truncate(s: string, width: number): string {
 export function normalizeOutput(text: string): string {
   const real = (text.match(/\n/g) ?? []).length
   const literal = (text.match(/\\n/g) ?? []).length
-  if (literal > real) return text.replace(/\\r\\n/g, '\n').replace(/\\n/g, '\n').replace(/\\t/g, '  ')
+  if (literal > real)
+    return text
+      .replace(/\\r\\n/g, '\n')
+      .replace(/\\n/g, '\n')
+      .replace(/\\t/g, '  ')
   return text
 }
 

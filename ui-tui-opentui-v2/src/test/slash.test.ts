@@ -46,7 +46,11 @@ describe('planCompletion (items 5 + 13)', () => {
       method: 'complete.path',
       params: { word: '@src/fo' }
     })
-    expect(planCompletion('cat ./rea')).toEqual({ from: 'cat '.length, method: 'complete.path', params: { word: './rea' } })
+    expect(planCompletion('cat ./rea')).toEqual({
+      from: 'cat '.length,
+      method: 'complete.path',
+      params: { word: './rea' }
+    })
     expect(planCompletion('open ~/proj')).toEqual({
       from: 'open '.length,
       method: 'complete.path',

@@ -27,7 +27,10 @@ export function Pager(props: { title: string; text: string; onClose: () => void 
   // handler below. Focus the root box on mount so the focus-within close layer is
   // active (the scrollbox isn't focused — scroll is global, not focus-gated).
   onMount(() => rootRef?.focus())
-  useCloseLayer(() => rootRef, () => props.onClose())
+  useCloseLayer(
+    () => rootRef,
+    () => props.onClose()
+  )
 
   useKeyboard(key => {
     // `q` closes (the footer advertises "Esc/q close"); Esc/Ctrl+C close via the

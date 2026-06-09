@@ -41,10 +41,7 @@ export function ReasoningPart(props: { text: string; streaming?: boolean }) {
   return (
     <Show when={summary().body || summary().title}>
       <box style={{ flexDirection: 'column', flexShrink: 0 }}>
-        <box
-          style={{ flexDirection: 'row', flexShrink: 0 }}
-          onMouseDown={toggle}
-        >
+        <box style={{ flexDirection: 'row', flexShrink: 0 }} onMouseDown={toggle}>
           <box style={{ flexShrink: 0, width: GUTTER }}>
             <text selectable={false}>
               <span style={{ fg: theme().color.accent }}>{expanded() ? '▼' : '▶'}</span>

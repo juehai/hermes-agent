@@ -20,8 +20,18 @@ export function ConfirmPrompt(props: { message: string; onYes: () => void; onNo:
   useBindings<BoxRenderable>(() => ({
     target: () => rootRef,
     commands: [
-      { name: 'confirm', run() { props.onYes() } },
-      { name: 'cancel', run() { props.onNo() } }
+      {
+        name: 'confirm',
+        run() {
+          props.onYes()
+        }
+      },
+      {
+        name: 'cancel',
+        run() {
+          props.onNo()
+        }
+      }
     ],
     bindings: [
       { key: 'y', cmd: 'confirm' },

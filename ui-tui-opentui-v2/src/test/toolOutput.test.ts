@@ -9,7 +9,9 @@ import { collapseToolOutput, stripAnsi, stripOmittedNote, stripToolEnvelope, tru
 describe('stripAnsi (item 8 - gateway slash/notice text is ANSI-colored for Ink)', () => {
   const ESC = String.fromCharCode(27)
   test('removes SGR color codes, keeps the text', () => {
-    expect(stripAnsi(`${ESC}[1;38;2;255;215;0m\u2713 Reasoning display: ON${ESC}[0m`)).toBe('\u2713 Reasoning display: ON')
+    expect(stripAnsi(`${ESC}[1;38;2;255;215;0m\u2713 Reasoning display: ON${ESC}[0m`)).toBe(
+      '\u2713 Reasoning display: ON'
+    )
   })
   test('removes italic + mouse sequences', () => {
     expect(stripAnsi(`${ESC}[2;3m  Model thinking shown.${ESC}[0m`)).toBe('  Model thinking shown.')
@@ -22,7 +24,9 @@ describe('stripAnsi (item 8 - gateway slash/notice text is ANSI-colored for Ink)
 
 describe('stripOmittedNote (item 2 — peel the gateway verbose-tail label)', () => {
   test('extracts the lines/chars note and returns the clean body', () => {
-    const { body, omittedNote } = stripOmittedNote('[showing verbose tail; omitted 5 lines / 234 chars]\nline one\nline two')
+    const { body, omittedNote } = stripOmittedNote(
+      '[showing verbose tail; omitted 5 lines / 234 chars]\nline one\nline two'
+    )
     expect(omittedNote).toBe('5 lines / 234 chars')
     expect(body).toBe('line one\nline two')
   })

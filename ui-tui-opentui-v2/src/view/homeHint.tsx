@@ -98,81 +98,96 @@ export function HomeHint(props: { store: SessionStore }) {
         border
         borderColor={theme().color.border}
       >
-      {/* session info block: model · Nous Research / dir / Session id */}
-      <box style={{ flexDirection: 'column' }}>
-        <Show when={info().model}>
-          {model => (
+        {/* session info block: model · Nous Research / dir / Session id */}
+        <box style={{ flexDirection: 'column' }}>
+          <Show when={info().model}>
+            {model => (
+              <text selectable={false}>
+                <span style={{ fg: theme().color.accent }}>{shortModel(model())}</span>
+                <span style={{ fg: theme().color.muted }}> · Nous Research</span>
+              </text>
+            )}
+          </Show>
+          <Show when={info().cwd}>
+            {cwd => (
+              <text selectable={false}>
+                <span style={{ fg: theme().color.muted }}>{shortCwd(cwd())}</span>
+                <Show when={info().branch}>
+                  <span style={{ fg: theme().color.muted }}>{` (${info().branch})`}</span>
+                </Show>
+              </text>
+            )}
+          </Show>
+          <Show when={props.store.state.sessionId}>
             <text selectable={false}>
-              <span style={{ fg: theme().color.accent }}>{shortModel(model())}</span>
-              <span style={{ fg: theme().color.muted }}> · Nous Research</span>
+              <span style={{ fg: theme().color.muted }}>Session: </span>
+              <span style={{ fg: theme().color.border }}>{props.store.state.sessionId}</span>
             </text>
-          )}
-        </Show>
-        <Show when={info().cwd}>
-          {cwd => (
-            <text selectable={false}>
-              <span style={{ fg: theme().color.muted }}>{shortCwd(cwd())}</span>
-              <Show when={info().branch}>
-                <span style={{ fg: theme().color.muted }}>{` (${info().branch})`}</span>
-              </Show>
-            </text>
-          )}
-        </Show>
-        <Show when={props.store.state.sessionId}>
-          <text selectable={false}>
-            <span style={{ fg: theme().color.muted }}>Session: </span>
-            <span style={{ fg: theme().color.border }}>{props.store.state.sessionId}</span>
-          </text>
-        </Show>
-      </box>
+          </Show>
+        </box>
 
-      {/* SEPARATE collapsible sections (Ink parity) + summary */}
-      <Show when={cat()}>
-        {c => (
-          <box style={{ flexDirection: 'column' }}>
-            <Section title="Available Tools" open>
-              <For each={enabledToolsets().slice(0, TOOLSETS_MAX)}>
-                {ts => (
+        {/* SEPARATE collapsible sections (Ink parity) + summary */}
+        <Show when={cat()}>
+          {c => (
+            <box style={{ flexDirection: 'column' }}>
+              <Section title="Available Tools" open>
+                <For each={enabledToolsets().slice(0, TOOLSETS_MAX)}>
+                  {ts => (
+                    <text selectable={false}>
+                      <span style={{ fg: theme().color.label }}>{`${ts.name}: `}</span>
+                      <span style={{ fg: theme().color.muted }}>
+                        {truncate(
+                          ts.tools.join(', ') || `${ts.count} tools`,
+                          Math.max(20, dims().width - ts.name.length - 8)
+                        )}
+                      </span>
+                    </text>
+                  )}
+                </For>
+                <Show when={enabledToolsets().length > TOOLSETS_MAX}>
                   <text selectable={false}>
-                    <span style={{ fg: theme().color.label }}>{`${ts.name}: `}</span>
-                    <span style={{ fg: theme().color.muted }}>
-                      {truncate(ts.tools.join(', ') || `${ts.count} tools`, Math.max(20, dims().width - ts.name.length - 8))}
-                    </span>
+                    <span
+                      style={{ fg: theme().color.muted }}
+                    >{`(and ${enabledToolsets().length - TOOLSETS_MAX} more toolsets…)`}</span>
                   </text>
-                )}
-              </For>
-              <Show when={enabledToolsets().length > TOOLSETS_MAX}>
+                </Show>
+              </Section>
+
+              <Section
+                title={`Available Skills (${c().skills.total})`}
+                suffix={`in ${c().skills.categories.length} categories`}
+              >
                 <text selectable={false}>
-                  <span style={{ fg: theme().color.muted }}>{`(and ${enabledToolsets().length - TOOLSETS_MAX} more toolsets…)`}</span>
+                  <span style={{ fg: theme().color.muted }}>
+                    {c()
+                      .skills.categories.map(s => `${s.name} (${s.count})`)
+                      .join('  ')}
+                  </span>
                 </text>
-              </Show>
-            </Section>
+              </Section>
 
-            <Section title={`Available Skills (${c().skills.total})`} suffix={`in ${c().skills.categories.length} categories`}>
-              <text selectable={false}>
-                <span style={{ fg: theme().color.muted }}>
-                  {c().skills.categories.map(s => `${s.name} (${s.count})`).join('  ')}
-                </span>
-              </text>
-            </Section>
+              <Section
+                title={`MCP Servers (${c().mcp.servers.length})`}
+                suffix={c().mcp.servers.length ? 'connected' : ''}
+              >
+                <text selectable={false}>
+                  <span style={{ fg: theme().color.muted }}>{c().mcp.servers.join('  ') || 'none configured'}</span>
+                </text>
+              </Section>
 
-            <Section title={`MCP Servers (${c().mcp.servers.length})`} suffix={c().mcp.servers.length ? 'connected' : ''}>
-              <text selectable={false}>
-                <span style={{ fg: theme().color.muted }}>{c().mcp.servers.join('  ') || 'none configured'}</span>
-              </text>
-            </Section>
-
-            <box style={{ marginTop: 1 }}>
-              <text selectable={false}>
-                <span style={{ fg: theme().color.text }}>{`${c().tools.total} tools`}</span>
-                <span style={{ fg: theme().color.muted }}>{` · ${c().skills.total} skills · ${c().mcp.servers.length} MCP · `}</span>
-                <span style={{ fg: theme().color.accent }}>/help</span>
-                <span style={{ fg: theme().color.muted }}> for commands</span>
-              </text>
+              <box style={{ marginTop: 1 }}>
+                <text selectable={false}>
+                  <span style={{ fg: theme().color.text }}>{`${c().tools.total} tools`}</span>
+                  <span
+                    style={{ fg: theme().color.muted }}
+                  >{` · ${c().skills.total} skills · ${c().mcp.servers.length} MCP · `}</span>
+                  <span style={{ fg: theme().color.accent }}>/help</span>
+                  <span style={{ fg: theme().color.muted }}> for commands</span>
+                </text>
+              </box>
             </box>
-          </box>
-        )}
-      </Show>
+          )}
+        </Show>
       </box>
       {/* end framed session panel */}
 
