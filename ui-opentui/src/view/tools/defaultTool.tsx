@@ -24,16 +24,26 @@ export const EXPANDED_MAX = 200
 /** Max labeled arg fields shown when expanded. */
 const FIELDS_MAX = 16
 
-/** The tool's structured args: `part.args` (tool.complete) or parsed argsText. */
+/**
+ * The tool's structured args. SECURITY: parse `part.argsText` FIRST — when it
+ * came from the gateway's verbose `args_text` (tool.start) it is REDACTED
+ * (server.py `_tool_args_text` masks secrets), while the raw `args` dict on
+ * `tool.complete` is sent unredacted. The store never overwrites a tool.start
+ * argsText — `tool.complete` only back-fills it by stringifying raw `args`
+ * when absent (store.ts) — so this precedence yields redacted values whenever
+ * the gateway sent them, and the same raw args as before otherwise. Raw
+ * `part.args` is the fallback when argsText is absent or unparseable.
+ */
 export function structuredArgs(part: ToolPartState): Record<string, unknown> | undefined {
-  if (part.args) return part.args
-  if (!part.argsText) return undefined
-  try {
-    const o: unknown = JSON.parse(part.argsText)
-    return o && typeof o === 'object' && !Array.isArray(o) ? (o as Record<string, unknown>) : undefined
-  } catch {
-    return undefined
+  if (part.argsText) {
+    try {
+      const o: unknown = JSON.parse(part.argsText)
+      if (o && typeof o === 'object' && !Array.isArray(o)) return o as Record<string, unknown>
+    } catch {
+      /* unparseable argsText (e.g. capped mid-JSON) — fall back to raw args */
+    }
   }
+  return part.args
 }
 
 function isPrimitive(v: unknown): v is string | number | boolean {

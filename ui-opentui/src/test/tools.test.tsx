@@ -14,7 +14,7 @@ import { describe, expect, test } from 'vitest'
 import { createSessionStore, type ToolPartState } from '../logic/store.ts'
 import { App } from '../view/App.tsx'
 import { ThemeProvider } from '../view/theme.tsx'
-import { BashToolBody } from '../view/tools/bashTool.tsx'
+import { BashToolBody, commandOf } from '../view/tools/bashTool.tsx'
 import { renderProbe, type RenderProbe } from './lib/render.ts'
 
 type Store = ReturnType<typeof createSessionStore>
@@ -232,5 +232,93 @@ describe('bash tool renderer — command + full output (Epic 2.4)', () => {
     } finally {
       probe.destroy()
     }
+  })
+})
+
+describe('redaction precedence — gateway args_text wins over raw args (security)', () => {
+  // The gateway redacts verbose `args_text` (server.py _tool_args_text) but
+  // sends the raw `args` dict on tool.complete UNREDACTED. structuredArgs must
+  // parse argsText first so masked secrets never render unmasked.
+
+  test('labeled fields render the redacted args_text value, never the raw args secret', async () => {
+    const store = createSessionStore()
+    seedTool(
+      store,
+      // verbose session: tool.start carries the gateway-redacted args_text
+      {
+        tool_id: 's1',
+        name: 'mcp_call',
+        args_text: JSON.stringify({ api_key: 'sk-****', endpoint: 'v1/users' }, null, 2)
+      },
+      // tool.complete carries the raw, UNREDACTED args dict
+      {
+        tool_id: 's1',
+        name: 'mcp_call',
+        args: { api_key: 'sk-secret123', endpoint: 'v1/users' },
+        result_text: 'done'
+      }
+    )
+
+    const probe = await mountApp(store)
+    try {
+      await clickHeader(probe, 'mcp_call')
+      const expanded = await probe.waitForFrame(f => f.includes('api_key'))
+      expect(expanded).toContain('sk-****') // the gateway's redaction survives
+      expect(expanded).not.toContain('sk-secret123') // the raw secret never renders
+      expect(expanded).toContain('endpoint') // non-secret fields still labeled
+      expect(expanded).toContain('v1/users')
+    } finally {
+      probe.destroy()
+    }
+  })
+
+  test('commandOf prefers the redacted args_text parse over the raw args command', () => {
+    const store = createSessionStore()
+    seedTool(
+      store,
+      {
+        tool_id: 's2',
+        name: 'terminal',
+        args_text: JSON.stringify({ command: 'curl -H "Authorization: sk-****" api.test' })
+      },
+      {
+        tool_id: 's2',
+        name: 'terminal',
+        args: { command: 'curl -H "Authorization: sk-secret123" api.test' },
+        result_text: 'ok'
+      }
+    )
+    // Going through the real store also pins the invariant this fix relies on:
+    // tool.complete back-fills argsText only when ABSENT — the redacted
+    // tool.start args_text is never overwritten.
+    const last = store.state.messages[store.state.messages.length - 1]
+    const part = last?.parts?.find((p): p is ToolPartState => p.type === 'tool' && p.id === 's2')
+    expect(part).toBeDefined()
+    expect(part?.argsText).toContain('sk-****')
+    const cmd = commandOf(part as ToolPartState)
+    expect(cmd).toContain('sk-****') // a masked command IS the correct display
+    expect(cmd).not.toContain('sk-secret123')
+  })
+
+  test('absent or unparseable argsText falls back to raw args (non-verbose parity)', () => {
+    // no argsText at all → raw args, same as the previous behavior
+    const bare: ToolPartState = {
+      type: 'tool',
+      id: 's3',
+      name: 'terminal',
+      state: 'complete',
+      args: { command: 'ls -la' }
+    }
+    expect(commandOf(bare)).toBe('ls -la')
+    // argsText capped mid-JSON (unparseable) → raw args still render
+    const capped: ToolPartState = {
+      type: 'tool',
+      id: 's4',
+      name: 'terminal',
+      state: 'complete',
+      args: { command: 'echo hi' },
+      argsText: '{"command": "echo h'
+    }
+    expect(commandOf(capped)).toBe('echo hi')
   })
 })

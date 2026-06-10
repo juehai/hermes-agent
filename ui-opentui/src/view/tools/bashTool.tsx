@@ -21,7 +21,9 @@ import { defaultSubtitle, resultLines, structuredArgs, ToolOutputBlock } from '.
 import type { ToolBodyProps, ToolRenderer } from './registry.tsx'
 
 /** The verbatim invocation: terminal `command` / execute_code `code` /
- *  process `action [session_id]`; else the gateway's argsPreview. */
+ *  process `action [session_id]`; else the gateway's argsPreview. Via
+ *  structuredArgs this prefers the gateway-redacted args_text parse — a
+ *  masked command string is the CORRECT display when the gateway redacted it. */
 export function commandOf(part: ToolPartState): string {
   const args = structuredArgs(part)
   if (args) {
