@@ -43,7 +43,7 @@ jobs:
       - name: Build installer
         run: npm run tauri:build
         working-directory: apps/bootstrap-installer
-        timeout-minutes: 2
+        timeout-minutes: 5
         env:
           # Pin the installer to the exact commit being tested so that the
           # install script checks out this PR/code rather than remote main.
