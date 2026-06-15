@@ -14,65 +14,43 @@ jobs:
     name: Build Hermes-Setup.exe
     runs-on: windows-latest
     timeout-minutes: 30
-    outputs:
-      cache-hit: ${{ steps.installer-cache.outputs.cache-hit }}
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Check installer source changes
-        uses: dorny/paths-filter@fbd0ab8f3e69293af611ebaee6363fc25e6d187d
-        id: changes
-        with:
-          filters: |
-            installer:
-              - 'package-lock.json'
-              - 'apps/bootstrap-installer/**'
-
+      # The cache key is the exact installer build fingerprint. A hit means
+      # this package-lock + bootstrap-installer source combo was already built,
+      # so we can skip the entire Node/Rust/toolchain dance and just upload it.
       - name: Restore installer build cache
-        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a986c91a # v4.2.0
         id: installer-cache
         with:
-          path: |
-            apps/bootstrap-installer/src-tauri/target/release/Hermes.exe
-            apps/bootstrap-installer/src-tauri/target/release/bundle/**/*.exe
+          path: Hermes-Setup.exe
           key: hermes-installer-${{ runner.os }}-${{ hashFiles('package-lock.json', 'apps/bootstrap-installer/**', '!apps/bootstrap-installer/src-tauri/target/**') }}
-          restore-keys: hermes-installer-${{ runner.os }}-
-
-      - name: Determine if installer needs rebuild
-        id: build-needed
-        shell: pwsh
-        run: |
-          $needed = 'false'
-          if ('${{ steps.changes.outputs.installer }}' -eq 'true' -or '${{ steps.installer-cache.outputs.cache-hit }}' -ne 'true') {
-            $needed = 'true'
-          }
-          Add-Content -Path $env:GITHUB_OUTPUT -Value "needed=$needed"
-          Write-Host "installer-changed=$('${{ steps.changes.outputs.installer }}') cache-hit=$('${{ steps.installer-cache.outputs.cache-hit }}') build-needed=$needed"
 
       - name: Setup Node.js
-        if: steps.build-needed.outputs.needed == 'true'
+        if: steps.installer-cache.outputs.cache-hit != 'true'
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
           cache: npm
 
       - name: Setup Rust
-        if: steps.build-needed.outputs.needed == 'true'
+        if: steps.installer-cache.outputs.cache-hit != 'true'
         uses: dtolnay/rust-toolchain@1.96.0 # stable
 
       - name: Install npm dependencies
-        if: steps.build-needed.outputs.needed == 'true'
+        if: steps.installer-cache.outputs.cache-hit != 'true'
         run: npm ci
 
       - name: Cache Rust targets
-        if: steps.build-needed.outputs.needed == 'true'
+        if: steps.installer-cache.outputs.cache-hit != 'true'
         uses: Swatinem/rust-cache@c106961feec855ef5a58494c5a2a31c9d80429a9
         with:
           workspaces: apps/bootstrap-installer/src-tauri
 
       - name: Build installer
-        if: steps.build-needed.outputs.needed == 'true'
+        if: steps.installer-cache.outputs.cache-hit != 'true'
         run: npm run tauri:build
         working-directory: apps/bootstrap-installer
         timeout-minutes: 10
@@ -81,9 +59,10 @@ jobs:
           # install script checks out this PR/code rather than remote main.
           HERMES_BUILD_PIN_COMMIT: ${{ github.sha }}
 
-      # Locate the built exe and normalize its name for downstream jobs.
-      # This runs after a build OR after a cache restore, so the file exists.
+      # Only runs on cache miss. Pick the exe the Tauri build produced and
+      # normalize its name so downstream jobs always know what to download.
       - name: Normalize installer artifact name
+        if: steps.installer-cache.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
           $candidates = @(
