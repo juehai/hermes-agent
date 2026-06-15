@@ -67,19 +67,17 @@ jobs:
           echo $wingetLinks | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
       - name: Setup Node.js
-        if: steps.build-needed.outputs.needed == 'true'
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
           cache: npm
 
+      - name: Install npm dependencies
+        run: npm ci
+
       - name: Setup Rust
         if: steps.build-needed.outputs.needed == 'true'
         uses: dtolnay/rust-toolchain@1.96.0 # stable
-
-      - name: Install npm dependencies
-        if: steps.build-needed.outputs.needed == 'true'
-        run: npm ci
 
       - name: Cache Rust targets
         if: steps.build-needed.outputs.needed == 'true'
