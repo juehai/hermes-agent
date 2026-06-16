@@ -1,4 +1,4 @@
-name: E2E — Windows Desktop
+name: E2E: Windows Desktop
 
 on:
   push:
@@ -117,10 +117,16 @@ jobs:
       HERMES_HOME: ${{ github.workspace }}\.e2e-hermes-home
 
     steps:
+
+      - name: Checkout src code to hermes home
+        uses: actions/checkout@v4
+        with:
+          path: ${{ github.workspace }}/.e2e-hermes-home/hermes-agent
+
       - name: Download installer artifact
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: hermes-installer-${{ runner.os }}-${{ hashFiles('package-lock.json', 'apps/bootstrap-installer/**', '!apps/bootstrap-installer/src-tauri/target/**') }}
+          name: hermes-installer-${{ runner.os }}-${{ hashFiles('${{ github.workspace }}.e2e-hermes-home/package-lock.json', '${{ github.workspace }}.e2e-hermes-home/apps/bootstrap-installer/**', '!${{ github.workspace }}.e2e-hermes-home/apps/bootstrap-installer/src-tauri/target/**') }}
 
       - name: Restore cached test tools
         id: test-tools-cache
@@ -165,11 +171,6 @@ jobs:
           }
           Copy-Item -Path 'Hermes-Setup.exe' -Destination "$downloads\Hermes-Setup.exe" -Force
           Write-Host "Staged installer: $downloads\Hermes-Setup.exe"
-
-      - name: Checkout src code to hermes home
-        uses: actions/checkout@v4
-        with:
-          path: ${{ github.workspace }}/.e2e-hermes-home/hermes-agent
 
       # ── Screen recording for coordinate discovery ───────────────────
       - name: Start screen recording
