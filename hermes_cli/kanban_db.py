@@ -88,6 +88,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
+from hermes_cli import kanban_projector
 from toolsets import get_toolset_names
 
 _log = logging.getLogger(__name__)
@@ -3135,6 +3136,193 @@ def append_event(
             protocol=protocol,
         )
         return AppendEventResult(event=ev, inserted=True, current_seq=new_seq)
+
+
+# ---------------------------------------------------------------------------
+# Kanban Protocol v1 (slice 3): deterministic rebuild + quarantine harness.
+#
+# The pure projector lives in ``hermes_cli.kanban_projector`` (no DB deps). The
+# functions below are the durable side: they read the per-task event stream in
+# replay order, run the pure projector, and materialize the result into the
+# slice-1 ``task_event_projections`` / ``task_event_quarantine`` tables.
+#
+# Everything here is shadow / non-enforcing: rebuild NEVER touches the ``tasks``
+# row or the runtime task state, and never mutates ``task_events`` (the global
+# autoincrement ``id`` cursor used by the notifier/dashboard is preserved).
+# Repeated rebuilds are idempotent: the projection row is upserted and
+# quarantine rows are written with INSERT OR IGNORE on the slice-1 UNIQUE key.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class TaskProjection:
+    """In-memory view of a ``task_event_projections`` row."""
+
+    task_id: str
+    up_to_seq: int
+    schema_version: int
+    projector_version: int
+    state_json: str
+    state_hash: str
+    poison_count: int
+    rebuilt_at: int
+
+    @property
+    def state(self) -> Optional[dict]:
+        try:
+            return json.loads(self.state_json)
+        except Exception:
+            return None
+
+
+def _events_for_projection(conn: sqlite3.Connection, task_id: str) -> list[Event]:
+    """Read a task's events in deterministic replay order for projection.
+
+    Orders by protocol ``seq`` (seq-bearing rows first, ascending) with the
+    global row ``id`` as the stable tie-break — the same ordering ``list_events``
+    uses. This is a read-only ``SELECT``; it does not alter the ``task_events.id``
+    cursor semantics.
+    """
+    rows = conn.execute(
+        "SELECT * FROM task_events WHERE task_id = ? "
+        "ORDER BY (seq IS NULL) ASC, seq ASC, id ASC",
+        (task_id,),
+    ).fetchall()
+    return [_event_from_row(r) for r in rows]
+
+
+def quarantine_event(
+    conn: sqlite3.Connection,
+    decision: "kanban_projector.QuarantineDecision",
+    *,
+    detected_at: Optional[int] = None,
+) -> bool:
+    """Durably record one quarantine decision, idempotently.
+
+    Uses ``INSERT OR IGNORE`` on the slice-1 ``UNIQUE(task_id, event_row_id,
+    projector_version)`` so re-quarantining the same poison event on a later
+    rebuild is a no-op. Returns ``True`` if a new row was inserted, ``False`` if
+    it already existed. Must be called inside an open write transaction.
+    """
+    now = detected_at if detected_at is not None else int(time.time())
+    payload_json = _canonical_json(decision.payload)
+    cur = conn.execute(
+        "INSERT OR IGNORE INTO task_event_quarantine ("
+        "task_id, event_row_id, event_id, seq, kind, schema_version, "
+        "projector_version, decision_key, reason, payload, detected_at"
+        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            decision.task_id,
+            decision.event_row_id,
+            decision.event_id,
+            decision.seq,
+            decision.kind,
+            decision.schema_version,
+            kanban_projector.PROJECTOR_VERSION,
+            decision.decision_key,
+            decision.reason,
+            payload_json,
+            now,
+        ),
+    )
+    return cur.rowcount > 0
+
+
+def list_quarantined_events(
+    conn: sqlite3.Connection, task_id: Optional[str] = None
+) -> list[dict]:
+    """List durable quarantine rows, optionally scoped to one task.
+
+    Ordered deterministically by ``(task_id, seq, event_row_id)``. Returns plain
+    dicts so callers don't depend on the row factory.
+    """
+    if task_id is None:
+        rows = conn.execute(
+            "SELECT * FROM task_event_quarantine "
+            "ORDER BY task_id ASC, (seq IS NULL) ASC, seq ASC, event_row_id ASC"
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM task_event_quarantine WHERE task_id = ? "
+            "ORDER BY (seq IS NULL) ASC, seq ASC, event_row_id ASC",
+            (task_id,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_task_projection(
+    conn: sqlite3.Connection, task_id: str
+) -> Optional[TaskProjection]:
+    """Read the persisted shadow projection row for ``task_id`` (or ``None``)."""
+    row = conn.execute(
+        "SELECT * FROM task_event_projections WHERE task_id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    return TaskProjection(
+        task_id=row["task_id"],
+        up_to_seq=int(row["up_to_seq"]),
+        schema_version=int(row["schema_version"]),
+        projector_version=int(row["projector_version"]),
+        state_json=row["state_json"],
+        state_hash=row["state_hash"],
+        poison_count=int(row["poison_count"]),
+        rebuilt_at=int(row["rebuilt_at"]),
+    )
+
+
+def rebuild_task_projection(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    rebuilt_at: Optional[int] = None,
+) -> "kanban_projector.ProjectionResult":
+    """Rebuild and durably persist the shadow projection for one task.
+
+    Reads the task's events in replay order, runs the pure projector, then in a
+    single write transaction upserts the ``task_event_projections`` row and
+    writes any quarantine decisions idempotently. Returns the
+    :class:`ProjectionResult` (the same value the pure projector produced) so the
+    caller can compare it against a live projection.
+
+    Shadow-only guarantees: the ``tasks`` row is never read or written here, and
+    ``task_events`` is only ``SELECT``-ed — replay does not change runtime task
+    state or the global event-id cursor.
+    """
+    events = _events_for_projection(conn, task_id)
+    result = kanban_projector.project_events(task_id, events)
+
+    now = rebuilt_at if rebuilt_at is not None else int(time.time())
+    with write_txn(conn):
+        conn.execute(
+            "INSERT INTO task_event_projections ("
+            "task_id, up_to_seq, schema_version, projector_version, "
+            "state_json, state_hash, poison_count, rebuilt_at"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(task_id) DO UPDATE SET "
+            "up_to_seq = excluded.up_to_seq, "
+            "schema_version = excluded.schema_version, "
+            "projector_version = excluded.projector_version, "
+            "state_json = excluded.state_json, "
+            "state_hash = excluded.state_hash, "
+            "poison_count = excluded.poison_count, "
+            "rebuilt_at = excluded.rebuilt_at",
+            (
+                task_id,
+                result.up_to_seq,
+                kanban_projector.PROJECTION_SCHEMA_VERSION,
+                result.projector_version,
+                result.state_json,
+                result.state_hash,
+                result.poison_count,
+                now,
+            ),
+        )
+        for decision in result.quarantined:
+            quarantine_event(conn, decision, detected_at=now)
+
+    return result
 
 
 def _end_run(

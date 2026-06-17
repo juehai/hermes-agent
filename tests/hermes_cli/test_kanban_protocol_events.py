@@ -13,6 +13,7 @@ The legacy ``_append_event`` / ``list_events`` path must keep working unchanged.
 from __future__ import annotations
 
 import concurrent.futures
+import json
 from pathlib import Path
 
 import pytest
@@ -246,3 +247,252 @@ def test_legacy_append_event_and_list_events_remain_compatible(kanban_home):
     # current_seq counts only seq-bearing rows; the legacy row does not perturb
     # the protocol head.
     assert _protocol_seqs(t) == [1]
+
+
+# ===========================================================================
+# Slice 3: deterministic pure projector + rebuild / quarantine harness.
+# ===========================================================================
+
+import time as _time
+
+from hermes_cli import kanban_projector as kp
+
+
+def _transition(conn, task_id, to_status, *, from_status, expected_seq, mid):
+    """Append a well-formed v1 lifecycle transition event."""
+    return kb.append_event(
+        conn,
+        task_id,
+        "transitioned",
+        payload={"to": to_status},
+        expected_seq=expected_seq,
+        message_id=mid,
+        transition={"from": from_status, "to": to_status},
+    )
+
+
+def _raw_event(
+    conn,
+    task_id,
+    *,
+    seq,
+    kind="transitioned",
+    schema_version,
+    transition=None,
+    payload=None,
+    event_id=None,
+    message_id=None,
+):
+    """Insert a hand-crafted task_events row, bypassing the strict ``append_event``
+    validation so legacy / poison / future-schema rows can be staged for the
+    projector. Must run inside a ``write_txn``.
+    """
+    conn.execute(
+        "INSERT INTO task_events ("
+        "task_id, kind, payload, created_at, seq, event_id, message_id, "
+        "schema_version, transition, protocol"
+        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            task_id,
+            kind,
+            json.dumps(payload) if payload else None,
+            int(_time.time()),
+            seq,
+            event_id,
+            message_id,
+            schema_version,
+            json.dumps(transition) if transition else None,
+            "hermes-kanban/1",
+        ),
+    )
+
+
+# 1. rebuild projection matches the live shadow state for a basic lifecycle
+def test_rebuild_matches_live_shadow_for_basic_lifecycle(kanban_home):
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="x")
+    with kb.connect() as conn:
+        _transition(conn, t, "review", from_status="running", expected_seq=0, mid="m1")
+        _transition(conn, t, "done", from_status="review", expected_seq=1, mid="m2")
+
+    with kb.connect() as conn:
+        events = kb.list_events(conn, t)
+        live = kp.project_events(t, events)
+        rebuilt = kb.rebuild_task_projection(conn, t)
+        persisted = kb.get_task_projection(conn, t)
+
+    assert live.state["status"] == "done"
+    assert rebuilt.state_json == live.state_json
+    assert rebuilt.state_hash == live.state_hash
+    assert persisted.state_json == live.state_json
+    assert persisted.state_hash == live.state_hash
+    assert persisted.up_to_seq == rebuilt.up_to_seq == 2
+    assert rebuilt.poison_count == 0
+
+
+# 2. replay determinism: same events → same projection, no duplicate quarantine
+def test_replay_is_deterministic_and_quarantine_idempotent(kanban_home):
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="x")
+        _transition(conn, t, "review", from_status="running", expected_seq=0, mid="m1")
+        with kb.write_txn(conn):
+            _raw_event(
+                conn, t, seq=2, schema_version=1, transition=None,
+                payload={"foo": "bar"}, event_id="ev_poison",
+            )
+
+    with kb.connect() as conn:
+        r1 = kb.rebuild_task_projection(conn, t)
+        r2 = kb.rebuild_task_projection(conn, t)
+
+    assert r1.state_json == r2.state_json
+    assert r1.state_hash == r2.state_hash
+    assert r1.up_to_seq == r2.up_to_seq == 2
+    assert r1.poison_count == r2.poison_count == 1
+
+    with kb.connect() as conn:
+        rows = kb.list_quarantined_events(conn, t)
+    assert len(rows) == 1  # two rebuilds, still exactly one durable quarantine row
+
+
+# 3. malformed v1 critical transition is quarantined with a stable decision_key
+def test_malformed_v1_transition_is_quarantined_with_stable_decision_key(kanban_home):
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="x")
+        with kb.write_txn(conn):
+            # schema_version 1 transitioned with no valid ``to`` → malformed.
+            _raw_event(
+                conn, t, seq=1, schema_version=1, kind="transitioned",
+                transition={"from": "running"}, event_id="ev_bad",
+            )
+
+    with kb.connect() as conn:
+        r1 = kb.rebuild_task_projection(conn, t)
+    assert r1.poison_count == 1
+    decision = r1.quarantined[0]
+    assert decision.reason == kp.REASON_MALFORMED_TRANSITION
+    key = decision.decision_key
+
+    with kb.connect() as conn:
+        r2 = kb.rebuild_task_projection(conn, t)
+    assert r2.quarantined[0].decision_key == key  # stable across rebuilds
+
+    with kb.connect() as conn:
+        rows = kb.list_quarantined_events(conn, t)
+    assert len(rows) == 1
+    assert rows[0]["decision_key"] == key
+    assert rows[0]["reason"] == kp.REASON_MALFORMED_TRANSITION
+
+
+# 4. poison present: live, persisted and rebuild projections agree; poison isolated
+def test_poison_event_isolated_live_and_rebuild_agree(kanban_home):
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="x")
+        _transition(conn, t, "review", from_status="running", expected_seq=0, mid="m1")
+        with kb.write_txn(conn):
+            _raw_event(conn, t, seq=2, schema_version=1, transition=None, event_id="ev_poison")
+        # Head is now 2 (the raw row); the next good transition lands at seq 3.
+        _transition(conn, t, "done", from_status="review", expected_seq=2, mid="m3")
+
+    with kb.connect() as conn:
+        events = kb.list_events(conn, t)
+        live = kp.project_events(t, events)
+        rebuilt = kb.rebuild_task_projection(conn, t)
+        persisted = kb.get_task_projection(conn, t)
+
+    # Poison is skipped; the two well-formed transitions still apply.
+    assert live.state["status"] == "done"
+    assert live.poison_count == 1
+    assert rebuilt.state_json == live.state_json == persisted.state_json
+    assert rebuilt.state_hash == live.state_hash == persisted.state_hash
+    assert rebuilt.up_to_seq == live.up_to_seq == 3
+
+
+# 5. poison in task A does not affect the projection for task B
+def test_poison_in_task_a_does_not_affect_task_b(kanban_home):
+    with kb.connect() as conn:
+        a = kb.create_task(conn, title="a")
+        b = kb.create_task(conn, title="b")
+        with kb.write_txn(conn):
+            _raw_event(conn, a, seq=1, schema_version=1, transition=None, event_id="ev_poison_a")
+        _transition(conn, b, "done", from_status="running", expected_seq=0, mid="mb")
+
+    with kb.connect() as conn:
+        ra = kb.rebuild_task_projection(conn, a)
+        rb = kb.rebuild_task_projection(conn, b)
+
+    assert ra.poison_count == 1
+    assert rb.poison_count == 0
+    assert rb.state["status"] == "done"
+
+    with kb.connect() as conn:
+        assert len(kb.list_quarantined_events(conn, a)) == 1
+        assert len(kb.list_quarantined_events(conn, b)) == 0
+
+
+# 6. legacy schema_version 0 events project without v1 transition fields
+def test_legacy_schema_version_0_projects_without_v1_fields(kanban_home):
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="x")
+        with kb.write_txn(conn):
+            _raw_event(
+                conn, t, seq=1, schema_version=0, kind="transitioned",
+                transition=None, payload={"to": "done"}, event_id="ev_legacy",
+            )
+
+    with kb.connect() as conn:
+        r = kb.rebuild_task_projection(conn, t)
+
+    # Legacy events lack v1 transition fields but must NOT be quarantined; the
+    # target status is read from the legacy payload via the compat adapter.
+    assert r.poison_count == 0
+    assert r.state["status"] == "done"
+
+
+# 7. unknown/future critical schema versions are quarantined conservatively
+def test_unknown_future_schema_critical_is_quarantined_deterministically(kanban_home):
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="x")
+        with kb.write_txn(conn):
+            _raw_event(
+                conn, t, seq=1, schema_version=99, kind="transitioned",
+                transition={"from": "running", "to": "done"}, event_id="ev_future",
+            )
+
+    with kb.connect() as conn:
+        r1 = kb.rebuild_task_projection(conn, t)
+        r2 = kb.rebuild_task_projection(conn, t)
+
+    assert r1.poison_count == 1
+    assert r1.quarantined[0].reason == kp.REASON_UNKNOWN_SCHEMA
+    # A future critical transition is NOT applied — conservatively quarantined.
+    assert r1.state.get("status") != "done"
+    assert r1.state_json == r2.state_json
+    assert r1.state_hash == r2.state_hash
+
+    with kb.connect() as conn:
+        assert len(kb.list_quarantined_events(conn, t)) == 1
+
+
+# Cursor / runtime-state invariants: rebuild must not mutate task_events ids or
+# the live ``tasks`` row (projection stays shadow / non-enforcing).
+def test_rebuild_does_not_mutate_events_or_task_state(kanban_home):
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="x")
+        _transition(conn, t, "done", from_status="running", expected_seq=0, mid="m1")
+
+    with kb.connect() as conn:
+        before_events = [(e.id, e.seq, e.kind) for e in kb.list_events(conn, t)]
+        before_status = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (t,)
+        ).fetchone()["status"]
+
+        kb.rebuild_task_projection(conn, t)
+
+        after_events = [(e.id, e.seq, e.kind) for e in kb.list_events(conn, t)]
+        after_status = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (t,)
+        ).fetchone()["status"]
+
+    assert before_events == after_events  # global id cursor untouched
+    assert before_status == after_status  # runtime task state untouched by replay
