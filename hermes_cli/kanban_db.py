@@ -2920,6 +2920,223 @@ def _append_event(
     )
 
 
+# ---------------------------------------------------------------------------
+# Kanban Protocol v1 (slice 2): structured append API with expected_seq CAS
+# and (task_id, message_id) idempotency.
+#
+# Layered on the slice 1 schema foundation (the nullable protocol columns and
+# the partial unique indexes ``idx_events_task_seq`` / ``idx_events_task_message``).
+# The legacy ``_append_event`` above stays seq-less and untyped for every
+# existing call site; ``append_event`` is the opt-in strict writer that
+# allocates a per-task ``seq`` and carries the protocol envelope.
+# ---------------------------------------------------------------------------
+
+# Default protocol tag stamped on structured events. Bumping the wire protocol
+# is a deliberate, separate change; the API default keeps writers consistent.
+PROTOCOL_V1 = "hermes-kanban/1"
+
+
+class KanbanProtocolError(RuntimeError):
+    """Base class for the structured ``append_event`` domain errors.
+
+    Callers can catch this to handle any protocol-level append failure without
+    depending on raw ``sqlite3`` exception types leaking through the API.
+    """
+
+
+class ExpectedSeqMismatch(KanbanProtocolError):
+    """Raised when ``expected_seq`` does not match the task's current head.
+
+    The compare-and-swap lost: another writer advanced the per-task ``seq``
+    between the caller reading the head and this append. ``current_seq`` carries
+    the freshly-observed head so the caller can re-read and re-validate rather
+    than blindly retrying. Nothing is written when this is raised.
+    """
+
+    def __init__(self, task_id: str, expected_seq: int, current_seq: int):
+        self.task_id = task_id
+        self.expected_seq = expected_seq
+        self.current_seq = current_seq
+        super().__init__(
+            f"expected_seq {expected_seq} != current_seq {current_seq} "
+            f"for task {task_id!r}"
+        )
+
+
+class EventIdempotencyConflict(KanbanProtocolError):
+    """Raised when a ``message_id`` is reused with a *different* logical request.
+
+    A duplicate ``message_id`` carrying the same logical request is idempotent
+    (returns the existing event); a duplicate carrying a conflicting request is
+    a caller bug and surfaces as this typed error instead of a raw sqlite
+    uniqueness violation. Nothing is written when this is raised.
+    """
+
+    def __init__(self, task_id: str, message_id: str, existing_event_id: Optional[str]):
+        self.task_id = task_id
+        self.message_id = message_id
+        self.existing_event_id = existing_event_id
+        super().__init__(
+            f"message_id {message_id!r} already used for task {task_id!r} with a "
+            f"different logical request (existing event {existing_event_id!r})"
+        )
+
+
+@dataclass
+class AppendEventResult:
+    """Outcome of :func:`append_event`.
+
+    ``inserted`` is ``True`` for a fresh row and ``False`` for an idempotent
+    replay that returned the pre-existing ``event``. ``current_seq`` is the
+    task's per-task head after the call (the new event's ``seq`` on insert, or
+    the observed head for a replay) — feed it back as the next ``expected_seq``.
+    """
+
+    event: Event
+    inserted: bool
+    current_seq: int
+
+
+def _canonical_json(obj: Optional[dict]) -> Optional[str]:
+    """Serialize ``obj`` to canonical JSON (sorted keys, stable separators).
+
+    Returns ``None`` for ``None`` so empty payload/transition store as SQL NULL.
+    The stable encoding makes stored rows comparable byte-for-byte, which is
+    what the idempotency same-request check relies on.
+    """
+    if obj is None:
+        return None
+    return json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _new_event_id() -> str:
+    """Generate a globally-unique protocol ``event_id``."""
+    return "ev_" + secrets.token_hex(8)
+
+
+def _protocol_head_seq(conn: sqlite3.Connection, task_id: str) -> int:
+    """Current per-task protocol head: ``COALESCE(MAX(seq), 0)``.
+
+    Only seq-bearing rows count; legacy / compatibility ``_append_event`` rows
+    carry NULL ``seq`` and never perturb the protocol head.
+    """
+    row = conn.execute(
+        "SELECT COALESCE(MAX(seq), 0) AS m FROM task_events WHERE task_id = ?",
+        (task_id,),
+    ).fetchone()
+    return int(row["m"])
+
+
+def append_event(
+    conn: sqlite3.Connection,
+    task_id: str,
+    kind: str,
+    payload: Optional[dict] = None,
+    *,
+    expected_seq: Optional[int],
+    message_id: Optional[str],
+    event_id: Optional[str] = None,
+    run_id: Optional[int] = None,
+    actor: Optional[str] = None,
+    source: Optional[str] = None,
+    transition: Optional[dict] = None,
+    schema_version: int = 1,
+    protocol: str = PROTOCOL_V1,
+) -> AppendEventResult:
+    """Append a structured protocol event with CAS + idempotency guarantees.
+
+    Allocates the next per-task ``seq`` and writes the full protocol envelope in
+    a single ``BEGIN IMMEDIATE`` transaction, so seq allocation, the
+    ``expected_seq`` compare-and-swap, and the ``(task_id, message_id)``
+    idempotency check are all atomic against concurrent writers.
+
+    Order of operations (deliberate):
+
+    1. **Idempotency first.** If ``message_id`` already exists for the task, the
+       call short-circuits *before* the CAS check. A retry whose ``expected_seq``
+       has since gone stale must still return the original event rather than
+       raise. Same logical request → ``inserted=False`` + existing event;
+       different logical request → :class:`EventIdempotencyConflict`.
+    2. **CAS.** If ``expected_seq is not None`` and it does not equal the current
+       head, raise :class:`ExpectedSeqMismatch` and write nothing.
+    3. **Insert** at ``seq = head + 1`` with a generated ``event_id`` (if not
+       supplied) and canonical-JSON ``payload`` / ``transition``.
+
+    ``expected_seq`` and ``message_id`` are required keyword args (pass ``None``
+    to opt out of CAS / idempotency respectively). The autoincrement
+    ``task_events.id`` is untouched, preserving the notifier/dashboard global
+    cursor semantics.
+    """
+    payload_json = _canonical_json(payload)
+    transition_json = _canonical_json(transition)
+
+    with write_txn(conn):
+        # (1) Idempotency — checked before CAS so a legit retry with a now-stale
+        # expected_seq returns the original result instead of mismatching.
+        if message_id is not None:
+            existing = conn.execute(
+                "SELECT * FROM task_events WHERE task_id = ? AND message_id = ?",
+                (task_id, message_id),
+            ).fetchone()
+            if existing is not None:
+                ev = _event_from_row(existing)
+                same_request = (
+                    ev.kind == kind
+                    and _canonical_json(ev.payload) == payload_json
+                    and _canonical_json(ev.transition) == transition_json
+                    and ev.actor == actor
+                    and ev.source == source
+                    and ev.protocol == protocol
+                    and ev.schema_version == schema_version
+                )
+                if not same_request:
+                    raise EventIdempotencyConflict(task_id, message_id, ev.event_id)
+                return AppendEventResult(
+                    event=ev,
+                    inserted=False,
+                    current_seq=_protocol_head_seq(conn, task_id),
+                )
+
+        # (2) Compare-and-swap on the per-task head.
+        current_seq = _protocol_head_seq(conn, task_id)
+        if expected_seq is not None and expected_seq != current_seq:
+            raise ExpectedSeqMismatch(task_id, expected_seq, current_seq)
+
+        # (3) Insert the new row at the next seq.
+        new_seq = current_seq + 1
+        new_event_id = event_id or _new_event_id()
+        now = int(time.time())
+        cur = conn.execute(
+            "INSERT INTO task_events ("
+            "task_id, run_id, kind, payload, created_at, "
+            "seq, event_id, message_id, schema_version, actor, source, "
+            "transition, protocol"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                task_id, run_id, kind, payload_json, now,
+                new_seq, new_event_id, message_id, schema_version, actor, source,
+                transition_json, protocol,
+            ),
+        )
+        ev = Event(
+            id=cur.lastrowid,
+            task_id=task_id,
+            kind=kind,
+            payload=payload,
+            created_at=now,
+            run_id=run_id,
+            seq=new_seq,
+            event_id=new_event_id,
+            message_id=message_id,
+            schema_version=schema_version,
+            actor=actor,
+            source=source,
+            transition=transition,
+            protocol=protocol,
+        )
+        return AppendEventResult(event=ev, inserted=True, current_seq=new_seq)
+
+
 def _end_run(
     conn: sqlite3.Connection,
     task_id: str,
