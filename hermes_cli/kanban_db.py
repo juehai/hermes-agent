@@ -964,6 +964,19 @@ class Event:
     payload: Optional[dict]
     created_at: int
     run_id: Optional[int] = None
+    # Kanban Protocol v1 (slice 1) optional fields. All default to None/0 so
+    # existing positional/keyword constructions keep working. Legacy rows get
+    # ``seq``/``event_id``/``schema_version`` backfilled by the migration; the
+    # remaining v1-only fields stay None until structured events are written in
+    # a later slice.
+    seq: Optional[int] = None
+    event_id: Optional[str] = None
+    message_id: Optional[str] = None
+    schema_version: Optional[int] = None
+    actor: Optional[str] = None
+    source: Optional[str] = None
+    transition: Optional[dict] = None
+    protocol: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -1125,6 +1138,44 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 
+-- Kanban Protocol v1 (slice 1): shadow/non-enforcing materialized projection
+-- of the per-task event stream. Runtime behaviour stays on the ``tasks`` row;
+-- this table is a read-model verifier that a later router/enforcement slice
+-- will populate and reconcile against. ``state_json`` is canonical JSON
+-- (sort_keys, stable separators) so live vs rebuild can be hashed/compared.
+CREATE TABLE IF NOT EXISTS task_event_projections (
+    task_id              TEXT PRIMARY KEY,
+    up_to_seq            INTEGER NOT NULL DEFAULT 0,
+    schema_version       INTEGER NOT NULL DEFAULT 1,
+    projector_version    INTEGER NOT NULL DEFAULT 1,
+    state_json           TEXT NOT NULL,
+    state_hash           TEXT NOT NULL,
+    poison_count         INTEGER NOT NULL DEFAULT 0,
+    rebuilt_at           INTEGER NOT NULL
+);
+
+-- Durable poison/quarantine record for malformed critical transition events.
+-- A separate table (not just a flag on task_events) keeps the durable reason
+-- and projector_version for audit and deterministic rebuilds; repeated
+-- rebuilds are idempotent via INSERT OR IGNORE on the UNIQUE key. The
+-- projector that writes these arrives in a later slice; slice 1 only creates
+-- the substrate and keeps it clean on hard-delete.
+CREATE TABLE IF NOT EXISTS task_event_quarantine (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id              TEXT NOT NULL,
+    event_row_id         INTEGER NOT NULL,
+    event_id             TEXT,
+    seq                  INTEGER,
+    kind                 TEXT NOT NULL,
+    schema_version       INTEGER,
+    projector_version    INTEGER NOT NULL DEFAULT 1,
+    decision_key         TEXT NOT NULL,
+    reason               TEXT NOT NULL,
+    payload              TEXT,
+    detected_at          INTEGER NOT NULL,
+    UNIQUE(task_id, event_row_id, projector_version)
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
@@ -1135,6 +1186,8 @@ CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, start
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
+CREATE INDEX IF NOT EXISTS idx_projection_rebuilt    ON task_event_projections(rebuilt_at);
+CREATE INDEX IF NOT EXISTS idx_quarantine_task_seq   ON task_event_quarantine(task_id, seq);
 """
 
 
@@ -1805,6 +1858,117 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         )
 
     _rebuild_drifted_tables(conn)
+
+    # Kanban Protocol v1 (slice 1). Runs LAST — after any drifted ``task_events``
+    # rebuild — so it always operates on the canonical, integer-id table and the
+    # additive columns/indexes never have to be threaded through ``_REBUILD_SPECS``
+    # (which would drop them on the DROP TABLE). Purely additive + idempotent, so
+    # fresh and rebuilt-legacy DBs converge on the identical schema.
+    _migrate_add_protocol_event_columns(conn)
+
+
+# Kanban Protocol v1 columns added to ``task_events`` after release. Nullable so
+# ``ALTER TABLE ... ADD COLUMN`` stays legacy-safe; the strict ``append_event``
+# API (a later slice) enforces required fields, not the SQLite schema.
+_PROTOCOL_EVENT_COLUMNS = (
+    ("seq", "seq INTEGER"),
+    ("event_id", "event_id TEXT"),
+    ("message_id", "message_id TEXT"),
+    ("schema_version", "schema_version INTEGER"),
+    ("actor", "actor TEXT"),
+    ("source", "source TEXT"),
+    # ``transition`` / ``protocol`` carry optional JSON / a protocol tag.
+    ("transition", "transition TEXT"),
+    ("protocol", "protocol TEXT"),
+)
+
+
+def _migrate_add_protocol_event_columns(conn: sqlite3.Connection) -> None:
+    """Additively extend ``task_events`` with the protocol columns and create
+    the protocol projection/quarantine indexes.
+
+    Idempotent: existing columns are skipped, the backfill only touches rows
+    that still lack a ``seq``/``event_id``, and every index is ``IF NOT
+    EXISTS``. The shadow projection and quarantine *tables* themselves come from
+    ``SCHEMA_SQL`` (``CREATE TABLE IF NOT EXISTS``), which is safe on legacy
+    boards because those tables are created fresh in the same script.
+    """
+    ev_cols = {row["name"] for row in conn.execute("PRAGMA table_info(task_events)")}
+    added_any = False
+    for name, ddl in _PROTOCOL_EVENT_COLUMNS:
+        if name not in ev_cols:
+            if _add_column_if_missing(conn, "task_events", name, ddl):
+                added_any = True
+
+    # Backfill legacy rows deterministically. Any row missing a ``seq`` is a
+    # pre-protocol (or compatibility ``_append_event``) row; assign a per-task
+    # monotonic seq ordered by (created_at, id) — created_at is only
+    # seconds-resolution so id is the stable tiebreak — and a readable, stable
+    # ``event_id``/``schema_version`` for the migrated history. Guard the whole
+    # pass on "are there any seq-less rows that should be backfilled" so it is a
+    # no-op on already-migrated boards.
+    #
+    # NOTE: this backfill targets the *legacy* history only. It runs once at
+    # migration time; rows written afterwards by the compatibility
+    # ``_append_event`` intentionally keep ``seq``/``event_id`` NULL until the
+    # structured ``append_event`` API (a later slice) populates them.
+    needs_backfill = conn.execute(
+        "SELECT 1 FROM task_events WHERE seq IS NULL LIMIT 1"
+    ).fetchone()
+    if needs_backfill is not None:
+        with write_txn(conn):
+            task_ids = [
+                row["task_id"]
+                for row in conn.execute(
+                    "SELECT DISTINCT task_id FROM task_events WHERE seq IS NULL"
+                )
+            ]
+            for task_id in task_ids:
+                rows = conn.execute(
+                    "SELECT id FROM task_events WHERE task_id = ? AND seq IS NULL "
+                    "ORDER BY created_at ASC, id ASC",
+                    (task_id,),
+                ).fetchall()
+                # Continue numbering after any seq already present for the task
+                # so a partially-backfilled board stays monotonic.
+                base = conn.execute(
+                    "SELECT COALESCE(MAX(seq), 0) AS m FROM task_events WHERE task_id = ?",
+                    (task_id,),
+                ).fetchone()["m"]
+                for offset, row in enumerate(rows, start=1):
+                    conn.execute(
+                        "UPDATE task_events "
+                        "SET seq = ?, "
+                        "    event_id = COALESCE(event_id, 'legacy:' || id), "
+                        "    schema_version = COALESCE(schema_version, 0) "
+                        "WHERE id = ?",
+                        (base + offset, row["id"]),
+                    )
+
+    # Indexes are created AFTER the additive columns exist (same rule as
+    # ``idx_events_run``): keeping them in SCHEMA_SQL would abort init on legacy
+    # boards whose ``task_events`` predates these columns. Partial unique indexes
+    # are the correct tool for the sparsely-populated ``seq``/``message_id``/
+    # ``event_id`` columns so NULLs never collide.
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_events_task_seq "
+        "ON task_events(task_id, seq) WHERE seq IS NOT NULL"
+    )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_events_task_message "
+        "ON task_events(task_id, message_id) WHERE message_id IS NOT NULL"
+    )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_events_event_id "
+        "ON task_events(event_id) WHERE event_id IS NOT NULL"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_events_task_seq_read "
+        "ON task_events(task_id, seq, id)"
+    )
+
+    if added_any:
+        _log.info("kanban migration: added protocol columns to task_events")
 
 
 # Legacy DBs defined these tables with a ``TEXT PRIMARY KEY`` id (or, for
@@ -2673,28 +2837,63 @@ def delete_attachment(conn: sqlite3.Connection, attachment_id: int) -> Optional[
     return att
 
 
+def _event_from_row(r: sqlite3.Row) -> Event:
+    """Hydrate an :class:`Event` from a ``task_events`` row.
+
+    Tolerant of legacy boards: the optional ``run_id`` and Kanban Protocol v1
+    columns are read defensively via ``r.keys()`` so a row selected before the
+    additive migration (or by a narrower ``SELECT``) still constructs cleanly.
+    """
+    keys = r.keys()
+
+    def _get(name):
+        return r[name] if name in keys else None
+
+    try:
+        payload = json.loads(r["payload"]) if r["payload"] else None
+    except Exception:
+        payload = None
+
+    transition_raw = _get("transition")
+    try:
+        transition = json.loads(transition_raw) if transition_raw else None
+    except Exception:
+        transition = None
+
+    run_id = _get("run_id")
+    seq = _get("seq")
+    schema_version = _get("schema_version")
+    return Event(
+        id=r["id"],
+        task_id=r["task_id"],
+        kind=r["kind"],
+        payload=payload,
+        created_at=r["created_at"],
+        run_id=int(run_id) if run_id is not None else None,
+        seq=int(seq) if seq is not None else None,
+        event_id=_get("event_id"),
+        message_id=_get("message_id"),
+        schema_version=int(schema_version) if schema_version is not None else None,
+        actor=_get("actor"),
+        source=_get("source"),
+        transition=transition,
+        protocol=_get("protocol"),
+    )
+
+
 def list_events(conn: sqlite3.Connection, task_id: str) -> list[Event]:
+    # Per-task replay order: prefer the protocol ``seq`` when present, falling
+    # back to (created_at, id) for legacy rows and for compatibility-appended
+    # rows that have no seq yet. ``seq IS NULL`` sorts seq-bearing rows (the
+    # migrated history) ahead of seq-less rows, and within each group the order
+    # is well-defined. For a board where nothing has a seq this collapses to the
+    # historical (created_at, id) ordering.
     rows = conn.execute(
-        "SELECT * FROM task_events WHERE task_id = ? ORDER BY created_at ASC, id ASC",
+        "SELECT * FROM task_events WHERE task_id = ? "
+        "ORDER BY (seq IS NULL) ASC, seq ASC, created_at ASC, id ASC",
         (task_id,),
     ).fetchall()
-    out = []
-    for r in rows:
-        try:
-            payload = json.loads(r["payload"]) if r["payload"] else None
-        except Exception:
-            payload = None
-        out.append(
-            Event(
-                id=r["id"],
-                task_id=r["task_id"],
-                kind=r["kind"],
-                payload=payload,
-                created_at=r["created_at"],
-                run_id=(int(r["run_id"]) if "run_id" in r.keys() and r["run_id"] is not None else None),
-            )
-        )
-    return out
+    return [_event_from_row(r) for r in rows]
 
 
 def _append_event(
@@ -4631,6 +4830,19 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
     return True
 
 
+def _delete_protocol_rows(conn: sqlite3.Connection, task_id: str) -> None:
+    """Clean the Kanban Protocol v1 shadow projection and durable quarantine
+    rows for ``task_id``.
+
+    Hard-delete paths already remove ``task_events`` for the task; the protocol
+    read-model/quarantine substrate is keyed off those events, so it must be
+    cleaned in the same transaction to avoid orphaned shadow state. Must be
+    called from within an open ``write_txn``.
+    """
+    conn.execute("DELETE FROM task_event_projections WHERE task_id = ?", (task_id,))
+    conn.execute("DELETE FROM task_event_quarantine WHERE task_id = ?", (task_id,))
+
+
 def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """Permanently remove an already-archived task and its related rows.
 
@@ -4651,6 +4863,7 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
         )
         conn.execute("DELETE FROM task_comments WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
+        _delete_protocol_rows(conn, task_id)
         conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
@@ -4674,6 +4887,7 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
         conn.execute("DELETE FROM task_links WHERE parent_id = ? OR child_id = ?", (task_id, task_id))
         conn.execute("DELETE FROM task_comments WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
+        _delete_protocol_rows(conn, task_id)
         conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
     recompute_ready(conn)
@@ -7361,15 +7575,10 @@ def unseen_events_for_sub(
     out: list[Event] = []
     max_id = cursor
     for r in rows:
-        try:
-            payload = json.loads(r["payload"]) if r["payload"] else None
-        except Exception:
-            payload = None
-        out.append(Event(
-            id=r["id"], task_id=r["task_id"], kind=r["kind"],
-            payload=payload, created_at=r["created_at"],
-            run_id=(int(r["run_id"]) if "run_id" in r.keys() and r["run_id"] is not None else None),
-        ))
+        # Notification streams stay ordered by the global ``id`` cursor (the
+        # ``ORDER BY id ASC`` above); only the hydration is shared with
+        # ``list_events`` so protocol fields don't drift between the two paths.
+        out.append(_event_from_row(r))
         max_id = max(max_id, int(r["id"]))
     return max_id, out
 

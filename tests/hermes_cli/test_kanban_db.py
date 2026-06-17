@@ -4372,3 +4372,248 @@ def test_bare_connect_does_not_close_on_context_exit(tmp_path):
     # Still usable after with-block exit (the leak).
     conn.execute("SELECT 1").fetchone()
     conn.close()  # explicit close to avoid leaking THIS test
+
+
+# ---------------------------------------------------------------------------
+# Kanban Protocol v1 — slice 1 schema/migration foundation
+# ---------------------------------------------------------------------------
+
+
+def _make_legacy_protocol_db(path: Path) -> None:
+    """Write a legacy board with the pre-protocol ``task_events`` shape.
+
+    The ``task_events`` table predates the protocol columns (no ``seq``,
+    ``event_id``, etc.) and even predates ``run_id`` — the oldest shape that
+    must still migrate cleanly. Tasks/events are inserted so per-task seq
+    backfill has a deterministic ordering to assert against.
+    """
+    conn = sqlite3.connect(str(path))
+    conn.executescript(kb.SCHEMA_SQL)
+    # Recreate task_events without any of the additive columns.
+    conn.executescript(
+        """
+        DROP TABLE task_events;
+        CREATE TABLE task_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            payload TEXT,
+            created_at INTEGER NOT NULL
+        );
+        """
+    )
+    conn.execute(
+        "INSERT INTO tasks (id, title, status, created_at) VALUES ('A', 'a', 'done', 10)"
+    )
+    conn.execute(
+        "INSERT INTO tasks (id, title, status, created_at) VALUES ('B', 'b', 'done', 10)"
+    )
+    # Task A: three events. Two share created_at=100 so (created_at, id) must
+    # break the tie by id. Insert them out of id order to prove ordering is by
+    # the SELECT, not insertion.
+    conn.execute("INSERT INTO task_events (id, task_id, kind, payload, created_at) VALUES (5, 'A', 'created', NULL, 100)")
+    conn.execute("INSERT INTO task_events (id, task_id, kind, payload, created_at) VALUES (6, 'A', 'claimed', NULL, 100)")
+    conn.execute("INSERT INTO task_events (id, task_id, kind, payload, created_at) VALUES (7, 'A', 'completed', NULL, 200)")
+    # Task B: two events, interleaved global ids with A.
+    conn.execute("INSERT INTO task_events (id, task_id, kind, payload, created_at) VALUES (8, 'B', 'created', NULL, 50)")
+    conn.execute("INSERT INTO task_events (id, task_id, kind, payload, created_at) VALUES (9, 'B', 'completed', NULL, 300)")
+    conn.commit()
+    conn.close()
+
+
+def test_protocol_migration_adds_columns_tables_and_indexes(tmp_path):
+    """Opening a legacy board adds the protocol columns, shadow projection and
+    durable quarantine tables, and their indexes — without breaking the open."""
+    db_path = tmp_path / "legacy-proto.db"
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+    _make_legacy_protocol_db(db_path)
+
+    with kb.connect(db_path) as conn:
+        ev_cols = {r["name"] for r in conn.execute("PRAGMA table_info(task_events)")}
+        tables = {
+            r["name"]
+            for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+        indexes = {
+            r["name"]
+            for r in conn.execute("SELECT name FROM sqlite_master WHERE type='index'")
+        }
+
+    for col in (
+        "seq", "event_id", "message_id", "schema_version",
+        "actor", "source", "transition", "protocol",
+    ):
+        assert col in ev_cols, f"missing protocol column {col}"
+
+    assert "task_event_projections" in tables
+    assert "task_event_quarantine" in tables
+
+    for idx in (
+        "idx_events_task_seq",
+        "idx_events_task_message",
+        "idx_events_event_id",
+        "idx_events_task_seq_read",
+        "idx_projection_rebuilt",
+        "idx_quarantine_task_seq",
+    ):
+        assert idx in indexes, f"missing index {idx}"
+
+
+def test_protocol_migration_backfills_deterministic_per_task_seq(tmp_path):
+    """Legacy events get a per-task monotonic seq ordered by (created_at, id),
+    independent of the global autoincrement id."""
+    db_path = tmp_path / "legacy-proto.db"
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+    _make_legacy_protocol_db(db_path)
+
+    with kb.connect(db_path) as conn:
+        a = conn.execute(
+            "SELECT id, seq FROM task_events WHERE task_id='A' ORDER BY id"
+        ).fetchall()
+        b = conn.execute(
+            "SELECT id, seq FROM task_events WHERE task_id='B' ORDER BY id"
+        ).fetchall()
+
+    # Task A: ids 5,6 share created_at=100 (tie broken by id), 7 is later.
+    assert {(r["id"], r["seq"]) for r in a} == {(5, 1), (6, 2), (7, 3)}
+    # Task B numbers independently from 1.
+    assert {(r["id"], r["seq"]) for r in b} == {(8, 1), (9, 2)}
+
+
+def test_protocol_migration_backfills_stable_event_id_and_schema_version(tmp_path):
+    """Legacy events get a deterministic ``event_id`` (``legacy:<id>``) and
+    ``schema_version`` 0; other protocol fields stay NULL."""
+    db_path = tmp_path / "legacy-proto.db"
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+    _make_legacy_protocol_db(db_path)
+
+    with kb.connect(db_path) as conn:
+        rows = conn.execute(
+            "SELECT id, event_id, schema_version, message_id, actor, "
+            "source, transition, protocol FROM task_events"
+        ).fetchall()
+
+    for r in rows:
+        assert r["event_id"] == f"legacy:{r['id']}"
+        assert r["schema_version"] == 0
+        assert r["message_id"] is None
+        assert r["actor"] is None
+        assert r["source"] is None
+        assert r["transition"] is None
+        assert r["protocol"] is None
+
+
+def test_protocol_migration_is_idempotent(tmp_path):
+    """Re-opening an already-migrated board leaves seq/event_id stable and
+    adds no duplicate rows."""
+    db_path = tmp_path / "legacy-proto.db"
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+    _make_legacy_protocol_db(db_path)
+
+    with kb.connect(db_path) as conn:
+        first = conn.execute(
+            "SELECT id, seq, event_id, schema_version FROM task_events ORDER BY id"
+        ).fetchall()
+        first_snapshot = [tuple(r) for r in first]
+
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+    with kb.connect(db_path) as conn:
+        second = conn.execute(
+            "SELECT id, seq, event_id, schema_version FROM task_events ORDER BY id"
+        ).fetchall()
+        second_snapshot = [tuple(r) for r in second]
+
+    assert first_snapshot == second_snapshot
+
+
+def test_protocol_seq_unique_index_rejects_duplicate_seq(tmp_path):
+    """The partial unique index forbids two rows sharing (task_id, seq)."""
+    db_path = tmp_path / "legacy-proto.db"
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+    _make_legacy_protocol_db(db_path)
+
+    with kb.connect(db_path) as conn:
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO task_events (task_id, kind, payload, created_at, seq) "
+                "VALUES ('A', 'dup', NULL, 400, 1)"
+            )
+
+
+def test_list_events_orders_by_seq_with_legacy_fallback(tmp_path):
+    """list_events returns legacy events in per-task seq order and hydrates the
+    optional protocol fields, while newly appended (seq-less) events sort by
+    (created_at, id) after the seq-bearing ones."""
+    db_path = tmp_path / "legacy-proto.db"
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+    _make_legacy_protocol_db(db_path)
+
+    with kb.connect(db_path) as conn:
+        events = kb.list_events(conn, "A")
+
+    kinds = [e.kind for e in events]
+    assert kinds == ["created", "claimed", "completed"]
+    assert [e.seq for e in events] == [1, 2, 3]
+    assert [e.event_id for e in events] == ["legacy:5", "legacy:6", "legacy:7"]
+    assert all(e.schema_version == 0 for e in events)
+    # Optional v1-only fields are absent on legacy rows.
+    assert all(e.message_id is None and e.transition is None for e in events)
+
+
+def test_append_event_compatibility_writes_legacy_row(tmp_path):
+    """The compatibility-only ``_append_event`` keeps inserting plain rows with
+    no protocol fields (seq stays NULL); they remain readable via list_events,
+    sorted after the migrated seq-bearing rows."""
+    db_path = tmp_path / "legacy-proto.db"
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+    _make_legacy_protocol_db(db_path)
+
+    with kb.connect(db_path) as conn:
+        with kb.write_txn(conn):
+            kb._append_event(conn, "A", "commented", {"author": "x"})
+        row = conn.execute(
+            "SELECT seq, event_id, schema_version FROM task_events "
+            "WHERE task_id='A' AND kind='commented'"
+        ).fetchone()
+        events = kb.list_events(conn, "A")
+
+    assert row["seq"] is None
+    assert row["event_id"] is None
+    assert row["schema_version"] is None
+    # Migrated seq rows first, the new seq-less row last.
+    assert [e.kind for e in events] == ["created", "claimed", "completed", "commented"]
+    assert events[-1].seq is None
+
+
+def test_delete_task_clears_projection_and_quarantine(tmp_path):
+    """Hard-delete paths that already delete task_events must also clean the
+    durable projection and quarantine rows for the task."""
+    db_path = tmp_path / "legacy-proto.db"
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+    _make_legacy_protocol_db(db_path)
+
+    with kb.connect(db_path) as conn:
+        now = int(time.time())
+        with kb.write_txn(conn):
+            conn.execute(
+                "INSERT INTO task_event_projections "
+                "(task_id, up_to_seq, state_json, state_hash, rebuilt_at) "
+                "VALUES ('A', 3, '{}', 'h', ?)",
+                (now,),
+            )
+            conn.execute(
+                "INSERT INTO task_event_quarantine "
+                "(task_id, event_row_id, kind, decision_key, reason, detected_at) "
+                "VALUES ('A', 5, 'created', 'k', 'r', ?)",
+                (now,),
+            )
+        assert kb.delete_task(conn, "A") is True
+        proj = conn.execute(
+            "SELECT COUNT(*) AS n FROM task_event_projections WHERE task_id='A'"
+        ).fetchone()["n"]
+        quar = conn.execute(
+            "SELECT COUNT(*) AS n FROM task_event_quarantine WHERE task_id='A'"
+        ).fetchone()["n"]
+
+    assert proj == 0
+    assert quar == 0
