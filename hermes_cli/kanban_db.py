@@ -3827,7 +3827,8 @@ def release_stale_claims(
     reclaimed = 0
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
     stale = conn.execute(
-        "SELECT id, claim_lock, worker_pid, claim_expires, last_heartbeat_at "
+        "SELECT id, claim_lock, worker_pid, claim_expires, last_heartbeat_at, "
+        "       current_run_id "
         "FROM tasks "
         "WHERE status = 'running' AND claim_expires IS NOT NULL "
         "  AND claim_expires < ?",
@@ -3857,9 +3858,13 @@ def release_stale_claims(
                     "UPDATE tasks SET claim_expires = ? "
                     "WHERE id = ? AND status = 'running' "
                     "  AND claim_lock IS ? "
+                    "  AND current_run_id IS ? "
                     "  AND claim_expires IS NOT NULL "
                     "  AND claim_expires < ?",
-                    (new_expires, row["id"], row["claim_lock"], now),
+                    (
+                        new_expires, row["id"], row["claim_lock"],
+                        row["current_run_id"], now,
+                    ),
                 )
                 if cur.rowcount != 1:
                     continue
@@ -3895,8 +3900,9 @@ def release_stale_claims(
                 "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL "
                 "WHERE id = ? AND status = 'running' AND claim_lock IS ? "
+                "AND current_run_id IS ? "
                 "AND claim_expires IS NOT NULL AND claim_expires < ?",
-                (row["id"], row["claim_lock"], now),
+                (row["id"], row["claim_lock"], row["current_run_id"], now),
             )
             if cur.rowcount != 1:
                 continue
@@ -5829,7 +5835,7 @@ def enforce_max_runtime(
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
 
     rows = conn.execute(
-        "SELECT t.id, t.worker_pid, "
+        "SELECT t.id, t.worker_pid, t.current_run_id, "
         "       COALESCE(r.started_at, t.started_at) AS active_started_at, "
         "       t.max_runtime_seconds, t.claim_lock "
         "FROM tasks t "
@@ -5882,8 +5888,9 @@ def enforce_max_runtime(
                 "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL, "
                 "last_heartbeat_at = NULL "
-                "WHERE id = ? AND status = 'running'",
-                (tid,),
+                "WHERE id = ? AND status = 'running' "
+                "AND current_run_id IS ? AND claim_lock IS ?",
+                (tid, row["current_run_id"], row["claim_lock"]),
             )
             if cur.rowcount == 1:
                 payload = {
@@ -5964,6 +5971,7 @@ def detect_stale_running(
 
     rows = conn.execute(
         "SELECT t.id, t.worker_pid, t.last_heartbeat_at, t.claim_lock, "
+        "       t.current_run_id, "
         "       COALESCE(r.started_at, t.started_at) AS active_started_at "
         "FROM tasks t "
         "LEFT JOIN task_runs r ON r.id = t.current_run_id "
@@ -5998,8 +6006,9 @@ def detect_stale_running(
                 "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL, "
                 "last_heartbeat_at = NULL "
-                "WHERE id = ? AND status = 'running'",
-                (tid,),
+                "WHERE id = ? AND status = 'running' "
+                "AND current_run_id IS ? AND claim_lock IS ?",
+                (tid, row["current_run_id"], row["claim_lock"]),
             )
             if cur.rowcount != 1:
                 continue
@@ -6310,6 +6319,13 @@ def _record_task_failure(
         failures = int(row["consecutive_failures"]) + 1
         cur_status = row["status"]
 
+        # Timeout/crash bookkeeping is a second phase after the caller's
+        # CAS moved the task back to ready. If a completion or other terminal
+        # transition won the race before this phase, do not resurrect failure
+        # counters or append a misleading gave_up event on top of it.
+        if not release_claim and cur_status not in {"ready", "running"}:
+            return False
+
         # Per-task override wins over both caller-supplied and default
         # thresholds. None (the common case) falls through.
         task_override = (
@@ -6326,7 +6342,7 @@ def _record_task_failure(
             # Trip the breaker.
             if release_claim:
                 # Spawn path: still running, also clear claim state.
-                conn.execute(
+                cur = conn.execute(
                     "UPDATE tasks SET status = 'blocked', claim_lock = NULL, "
                     "claim_expires = NULL, worker_pid = NULL, "
                     "consecutive_failures = ?, last_failure_error = ? "
@@ -6337,12 +6353,14 @@ def _record_task_failure(
                 # Timeout/crash path: task is already at ``ready``
                 # with claim cleared; just flip to blocked + update
                 # counter fields.
-                conn.execute(
+                cur = conn.execute(
                     "UPDATE tasks SET status = 'blocked', "
                     "consecutive_failures = ?, last_failure_error = ? "
                     "WHERE id = ? AND status IN ('ready', 'running')",
                     (failures, error[:500], task_id),
                 )
+            if cur.rowcount != 1:
+                return False
             run_id = None
             if end_run:
                 # Only the spawn path has an open run to close.
@@ -6374,7 +6392,7 @@ def _record_task_failure(
             # Below threshold.
             if release_claim:
                 # Spawn path: transition running → ready + clear claim.
-                conn.execute(
+                cur = conn.execute(
                     "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
                     "claim_expires = NULL, worker_pid = NULL, "
                     "consecutive_failures = ?, last_failure_error = ? "
@@ -6384,11 +6402,14 @@ def _record_task_failure(
             else:
                 # Timeout/crash path: task is already at ``ready`` via
                 # its own UPDATE. Just bookkeep the counter + last error.
-                conn.execute(
+                cur = conn.execute(
                     "UPDATE tasks SET consecutive_failures = ?, "
-                    "last_failure_error = ? WHERE id = ?",
+                    "last_failure_error = ? WHERE id = ? "
+                    "AND status IN ('ready', 'running')",
                     (failures, error[:500], task_id),
                 )
+            if cur.rowcount != 1:
+                return False
             if end_run:
                 # Spawn path: close the open run with outcome.
                 run_id = _end_run(

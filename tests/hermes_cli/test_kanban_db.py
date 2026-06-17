@@ -384,6 +384,7 @@ def test_schedule_task_parks_time_delay_without_dispatching(kanban_home):
         t = kb.create_task(conn, title="delayed recheck", assignee="ops")
         assert kb.schedule_task(conn, t, reason="run next week") is True
         task = kb.get_task(conn, t)
+        assert task is not None
         assert task.status == "scheduled"
         assert kb.claim_task(conn, t) is None
 
@@ -464,6 +465,7 @@ def test_stale_claim_with_live_pid_extends_instead_of_reclaiming(
         )
         assert reclaimed == 0
         task = kb.get_task(conn, t)
+        assert task is not None
         assert task.status == "running"
         assert task.claim_expires is not None
         assert task.claim_expires > old_expires
@@ -928,6 +930,132 @@ def test_max_runtime_uses_current_run_start_after_retry(kanban_home, monkeypatch
         assert kb.get_task(conn, t).status == "running"
 
 
+def test_max_runtime_loses_to_completion_without_overwriting_done(
+    kanban_home, monkeypatch,
+):
+    """A worker completion that lands during timeout enforcement wins.
+
+    ``enforce_max_runtime`` selects candidates before sending signals. If the
+    worker completes before the timeout CAS runs, the timeout path must re-read
+    through the guarded UPDATE, emit no timeout event, and leave ``done`` alone.
+    """
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+
+    with kb.connect() as conn:
+        host = kb._claimer_id().split(":", 1)[0]
+        t = kb.create_task(
+            conn, title="race", assignee="a", max_runtime_seconds=1,
+        )
+        kb.claim_task(conn, t, claimer=f"{host}:worker")
+        run = kb.latest_run(conn, t)
+        assert run is not None
+        run_id = run.id
+        old_started = int(time.time()) - 20
+        conn.execute(
+            "UPDATE tasks SET started_at = ?, worker_pid = ? WHERE id = ?",
+            (old_started, 424242, t),
+        )
+        conn.execute(
+            "UPDATE task_runs SET started_at = ?, worker_pid = ? WHERE id = ?",
+            (old_started, 424242, run_id),
+        )
+
+        def _complete_on_signal(_pid, _sig):
+            assert kb.complete_task(
+                conn, t, summary="finished", expected_run_id=run_id,
+            ) is True
+
+        assert kb.enforce_max_runtime(conn, signal_fn=_complete_on_signal) == []
+        task = kb.get_task(conn, t)
+        assert task is not None
+        assert task.status == "done"
+        assert task.consecutive_failures == 0
+        kinds = [e.kind for e in kb.list_events(conn, t)]
+        assert kinds.count("completed") == 1
+        assert "timed_out" not in kinds
+        assert "gave_up" not in kinds
+
+
+def test_max_runtime_win_rejects_stale_completion_and_emits_one_timeout(
+    kanban_home, monkeypatch,
+):
+    """When timeout wins, stale worker completion cannot reopen the run."""
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+
+    with kb.connect() as conn:
+        host = kb._claimer_id().split(":", 1)[0]
+        t = kb.create_task(
+            conn, title="race", assignee="a", max_runtime_seconds=1,
+            max_retries=5,
+        )
+        kb.claim_task(conn, t, claimer=f"{host}:worker")
+        run = kb.latest_run(conn, t)
+        assert run is not None
+        run_id = run.id
+        old_started = int(time.time()) - 20
+        conn.execute(
+            "UPDATE tasks SET started_at = ?, worker_pid = ? WHERE id = ?",
+            (old_started, 525252, t),
+        )
+        conn.execute(
+            "UPDATE task_runs SET started_at = ?, worker_pid = ? WHERE id = ?",
+            (old_started, 525252, run_id),
+        )
+
+        assert kb.enforce_max_runtime(
+            conn, signal_fn=lambda _pid, _sig: None,
+        ) == [t]
+        task = kb.get_task(conn, t)
+        assert task is not None
+        assert task.status == "ready"
+        assert kb.complete_task(
+            conn, t, summary="late", expected_run_id=run_id,
+        ) is False
+        task = kb.get_task(conn, t)
+        assert task is not None
+        assert task.status == "ready"
+        kinds = [e.kind for e in kb.list_events(conn, t)]
+        assert kinds.count("timed_out") == 1
+        assert "completed" not in kinds
+        outcomes = [
+            r["outcome"] for r in conn.execute(
+                "SELECT outcome FROM task_runs WHERE task_id = ?", (t,),
+            ).fetchall()
+        ]
+        assert outcomes.count("timed_out") == 1
+
+
+def test_timeout_failure_bookkeeping_skips_terminal_cas_loser(kanban_home):
+    """Second-phase timeout bookkeeping revalidates terminal state.
+
+    This covers the CAS-loser path directly: if a valid completion reaches
+    ``done`` before the timeout/crash failure counter phase runs, the loser exits
+    without blind retrying, changing counters, or appending ``gave_up``.
+    """
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="done", assignee="a")
+        kb.claim_task(conn, t)
+        assert kb.complete_task(conn, t, summary="done") is True
+
+        tripped = kb._record_task_failure(
+            conn, t,
+            error="elapsed 20s > limit 1s",
+            outcome="timed_out",
+            release_claim=False,
+            end_run=False,
+            failure_limit=1,
+        )
+
+        assert tripped is False
+        task = kb.get_task(conn, t)
+        assert task is not None
+        assert task.status == "done"
+        assert task.consecutive_failures == 0
+        kinds = [e.kind for e in kb.list_events(conn, t)]
+        assert kinds.count("completed") == 1
+        assert "gave_up" not in kinds
+
+
 def test_heartbeat_extends_claim(kanban_home):
     with kb.connect() as conn:
         t = kb.create_task(conn, title="x", assignee="a")
@@ -1012,6 +1140,7 @@ def test_unblock_resets_failure_counters(kanban_home):
         conn.commit()
         assert kb.unblock_task(conn, t)
         task = kb.get_task(conn, t)
+        assert task is not None
         assert task.status == "ready"
         assert task.consecutive_failures == 0
         assert task.last_failure_error is None
@@ -1076,6 +1205,7 @@ def test_recompute_ready_recovers_below_limit(kanban_home):
             failure_limit=2,
         )
         task = kb.get_task(conn, t)
+        assert task is not None
         assert task.status == "ready"
         assert task.consecutive_failures == 1
 
@@ -1088,6 +1218,7 @@ def test_recompute_ready_recovers_below_limit(kanban_home):
         promoted = kb.recompute_ready(conn)
         assert promoted == 1
         task = kb.get_task(conn, t)
+        assert task is not None
         assert task.status == "ready"
         # Counter must be preserved, not reset.
         assert task.consecutive_failures == 1
@@ -1122,6 +1253,7 @@ def test_recompute_ready_honours_dispatcher_failure_limit(kanban_home):
         )
         assert promoted == 1
         task = kb.get_task(conn, t)
+        assert task is not None
         assert task.status == "ready"
         assert task.consecutive_failures == kb.DEFAULT_FAILURE_LIMIT
 
@@ -1156,6 +1288,7 @@ def test_recompute_ready_per_task_max_retries_overrides_dispatcher(kanban_home):
         promoted = kb.recompute_ready(conn, failure_limit=2)
         assert promoted == 1
         task = kb.get_task(conn, t)
+        assert task is not None
         assert task.status == "ready"
         assert task.consecutive_failures == 2
 
@@ -3476,6 +3609,7 @@ def test_detect_stale_returns_running_task_with_no_heartbeat(kanban_home, monkey
         )
         assert t in stale, "Task with no heartbeat for >4h should be reclaimed"
         task = kb.get_task(conn, t)
+        assert task is not None
         assert task.status == "ready"
 
 
