@@ -90,6 +90,10 @@ from typing import Any, Iterable, Optional
 
 from toolsets import get_toolset_names
 
+# Pure projector (no DB/I-O dependency); safe top-level import — it does not
+# import back into kanban_db, so there is no import cycle.
+from hermes_cli import kanban_projector
+
 _log = logging.getLogger(__name__)
 
 
@@ -964,6 +968,20 @@ class Event:
     payload: Optional[dict]
     created_at: int
     run_id: Optional[int] = None
+    # Protocol v1 (Hermes Kanban Protocol) fields. All optional and default
+    # ``None`` so legacy events appended via ``_append_event`` and every
+    # existing positional/keyword construction of ``Event`` keep working
+    # unchanged. ``seq`` is the per-task monotonic sequence used for the
+    # ``append_event`` compare-and-set; ``schema_version`` is 0 for legacy
+    # events and >= 1 for protocol events.
+    seq: Optional[int] = None
+    event_id: Optional[str] = None
+    message_id: Optional[str] = None
+    schema_version: Optional[int] = None
+    actor: Optional[str] = None
+    source: Optional[str] = None
+    transition: Optional[str] = None
+    protocol: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -1060,7 +1078,59 @@ CREATE TABLE IF NOT EXISTS task_events (
     run_id     INTEGER,
     kind       TEXT NOT NULL,
     payload    TEXT,
-    created_at INTEGER NOT NULL
+    created_at INTEGER NOT NULL,
+    -- Hermes Kanban Protocol v1 fields. All nullable and additive: migrated
+    -- historical rows and fresh legacy-compatible rows get seq/event_id and
+    -- schema_version=0, while optional protocol metadata remains NULL unless a
+    -- caller uses ``append_event``. ``seq`` is the per-task monotonic sequence
+    -- used by append_event's compare-and-set; ``message_id`` is the per-task
+    -- idempotency key.
+    -- partial unique indexes that enforce (task_id, seq), (task_id,
+    -- message_id) and event_id live in ``_migrate_add_optional_columns`` (a
+    -- CREATE INDEX over these columns inside SCHEMA_SQL would abort opening a
+    -- legacy board whose task_events predates them).
+    seq            INTEGER,
+    event_id       TEXT,
+    message_id     TEXT,
+    schema_version INTEGER,
+    actor          TEXT,
+    source         TEXT,
+    transition     TEXT,
+    protocol       TEXT
+);
+
+-- Projection snapshot: the deterministic state the pure projector
+-- (kanban_projector) derives from a task's event stream. One row per task,
+-- rewritten in place by ``rebuild_task_projection``. ``state_hash`` /
+-- ``state_json`` are canonical so a live projection and a rebuilt-from-scratch
+-- projection of the same events compare identically. This slice never mutates
+-- the canonical ``tasks`` row from here — the snapshot is read-only derived.
+CREATE TABLE IF NOT EXISTS task_event_projections (
+    task_id           TEXT PRIMARY KEY,
+    status            TEXT,
+    last_seq          INTEGER,
+    last_event_id     INTEGER,
+    applied_count     INTEGER NOT NULL DEFAULT 0,
+    quarantined_count INTEGER NOT NULL DEFAULT 0,
+    state_hash        TEXT NOT NULL,
+    state_json        TEXT NOT NULL,
+    updated_at        INTEGER NOT NULL
+);
+
+-- Durable quarantine of poison events: schema_version >= 1 critical lifecycle
+-- events whose transition/target is malformed. The projector skips them so a
+-- single bad event cannot wedge a task's replay; this table records the
+-- deterministic decision. Idempotent across rebuilds via the partial unique
+-- index on (task_id, event_row_id) below.
+CREATE TABLE IF NOT EXISTS task_event_quarantine (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id      TEXT NOT NULL,
+    event_row_id INTEGER,
+    event_id     TEXT,
+    seq          INTEGER,
+    kind         TEXT,
+    reason       TEXT NOT NULL,
+    created_at   INTEGER NOT NULL
 );
 
 -- Historical attempt record. Each time the dispatcher claims a task, a
@@ -1135,6 +1205,8 @@ CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, start
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
+-- Protocol projection/quarantine indexes are created in
+-- _migrate_add_optional_columns after legacy board tables have been widened.
 """
 
 
@@ -1722,6 +1794,125 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         "ON task_events(run_id, id)"
     )
 
+    # Hermes Kanban Protocol v1: additive ``task_events`` columns. Re-snapshot
+    # the column set first (the run_id ALTER above may have changed it).
+    ev_cols = {row["name"] for row in conn.execute("PRAGMA table_info(task_events)")}
+    added_protocol = False
+    for name, ddl in (
+        ("seq", "seq INTEGER"),
+        ("event_id", "event_id TEXT"),
+        ("message_id", "message_id TEXT"),
+        ("schema_version", "schema_version INTEGER"),
+        ("actor", "actor TEXT"),
+        ("source", "source TEXT"),
+        ("transition", "transition TEXT"),
+        ("protocol", "protocol TEXT"),
+    ):
+        if name not in ev_cols:
+            _add_column_if_missing(conn, "task_events", name, ddl)
+            added_protocol = True
+
+    # Partial unique indexes enforcing the protocol invariants:
+    #   (task_id, seq)        — the append_event compare-and-set head,
+    #   (task_id, message_id) — per-task idempotency key,
+    #   event_id              — globally unique event identity.
+    # Created unconditionally (IF NOT EXISTS) so fresh boards — whose columns
+    # come from SCHEMA_SQL rather than the ALTERs above — get them too. Same
+    # post-ALTER ordering rule as idx_events_run.
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_events_seq "
+        "ON task_events(task_id, seq) WHERE seq IS NOT NULL"
+    )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_events_message_id "
+        "ON task_events(task_id, message_id) WHERE message_id IS NOT NULL"
+    )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_events_event_id "
+        "ON task_events(event_id) WHERE event_id IS NOT NULL"
+    )
+
+    # One-shot deterministic backfill of historical events. Per task, ordered
+    # by (created_at, id): seq = 1..N (row number), event_id = 'legacy:<id>',
+    # schema_version = 0 (legacy — projected on kind alone, no transition
+    # required). Guarded by ``seq IS NULL`` so it only ever touches
+    # pre-protocol rows and is idempotent across re-opens. Runs only when the
+    # columns were just added (a board being migrated for the first time).
+    #
+    # Issued as a bare statement (not wrapped in ``write_txn``) to match every
+    # other write in this migration: ``_migrate_add_optional_columns`` runs on
+    # whatever connection ``init_db``/the caller hands it, including a default
+    # isolation-level ``sqlite3.Connection`` that already has an implicit
+    # transaction open from the column-copy UPDATEs above. An explicit
+    # ``BEGIN IMMEDIATE`` there would raise "cannot start a transaction within
+    # a transaction"; a single UPDATE is atomic on its own regardless.
+    if added_protocol:
+        conn.execute(
+            """
+            UPDATE task_events
+               SET seq = (
+                   SELECT COUNT(*) FROM task_events AS e2
+                    WHERE e2.task_id = task_events.task_id
+                      AND (e2.created_at < task_events.created_at
+                           OR (e2.created_at = task_events.created_at
+                               AND e2.id <= task_events.id))
+               ),
+                   event_id = 'legacy:' || id,
+                   schema_version = 0
+             WHERE seq IS NULL
+            """
+        )
+
+    # Protocol projection/quarantine tables existed in early local/advisory
+    # builds with a narrower shape. ``CREATE TABLE IF NOT EXISTS`` intentionally
+    # leaves those tables in place, so widen them additively before creating
+    # indexes that reference the new columns. This keeps live boards and retry
+    # runs migratable instead of failing connect() during SCHEMA_SQL.
+    projection_cols = {
+        row["name"] for row in conn.execute("PRAGMA table_info(task_event_projections)")
+    }
+    if projection_cols:
+        for name, ddl in (
+            ("status", "status TEXT"),
+            ("last_seq", "last_seq INTEGER"),
+            ("last_event_id", "last_event_id INTEGER"),
+            ("applied_count", "applied_count INTEGER NOT NULL DEFAULT 0"),
+            ("quarantined_count", "quarantined_count INTEGER NOT NULL DEFAULT 0"),
+            ("state_hash", "state_hash TEXT"),
+            ("state_json", "state_json TEXT"),
+            ("updated_at", "updated_at INTEGER NOT NULL DEFAULT 0"),
+        ):
+            if name not in projection_cols:
+                _add_column_if_missing(conn, "task_event_projections", name, ddl)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_projection_status "
+            "ON task_event_projections(status)"
+        )
+
+    quarantine_cols = {
+        row["name"] for row in conn.execute("PRAGMA table_info(task_event_quarantine)")
+    }
+    if quarantine_cols:
+        for name, ddl in (
+            ("event_row_id", "event_row_id INTEGER"),
+            ("event_id", "event_id TEXT"),
+            ("seq", "seq INTEGER"),
+            ("kind", "kind TEXT"),
+            ("reason", "reason TEXT"),
+            ("created_at", "created_at INTEGER NOT NULL DEFAULT 0"),
+        ):
+            if name not in quarantine_cols:
+                _add_column_if_missing(conn, "task_event_quarantine", name, ddl)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_quarantine_task "
+            "ON task_event_quarantine(task_id, created_at)"
+        )
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_quarantine_event "
+            "ON task_event_quarantine(task_id, event_row_id) "
+            "WHERE event_row_id IS NOT NULL"
+        )
+
     notify_table_exists = conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='kanban_notify_subs'"
     ).fetchone() is not None
@@ -1825,10 +2016,18 @@ _REBUILD_SPECS = {
         "CREATE TABLE task_events ("
         " id INTEGER PRIMARY KEY AUTOINCREMENT,"
         " task_id TEXT NOT NULL, run_id INTEGER, kind TEXT NOT NULL,"
-        " payload TEXT, created_at INTEGER NOT NULL)",
+        " payload TEXT, created_at INTEGER NOT NULL,"
+        " seq INTEGER, event_id TEXT, message_id TEXT, schema_version INTEGER,"
+        " actor TEXT, source TEXT, transition TEXT, protocol TEXT)",
         (
             "CREATE INDEX idx_events_task ON task_events(task_id, created_at)",
             "CREATE INDEX idx_events_run ON task_events(run_id, id)",
+            "CREATE UNIQUE INDEX idx_events_seq "
+            "ON task_events(task_id, seq) WHERE seq IS NOT NULL",
+            "CREATE UNIQUE INDEX idx_events_message_id "
+            "ON task_events(task_id, message_id) WHERE message_id IS NOT NULL",
+            "CREATE UNIQUE INDEX idx_events_event_id "
+            "ON task_events(event_id) WHERE event_id IS NOT NULL",
         ),
     ),
     "task_comments": (
@@ -2673,28 +2872,331 @@ def delete_attachment(conn: sqlite3.Connection, attachment_id: int) -> Optional[
     return att
 
 
+def _row_to_event(r: sqlite3.Row) -> Event:
+    """Build an :class:`Event` from a ``task_events`` row.
+
+    Tolerant of older row shapes: any protocol column that is absent (a board
+    opened before a given migration, or a row read through a narrower SELECT)
+    simply stays ``None`` rather than raising.
+    """
+    keys = r.keys()
+
+    def _get(name):
+        return r[name] if name in keys else None
+
+    try:
+        payload = json.loads(r["payload"]) if r["payload"] else None
+    except Exception:
+        payload = None
+    run_id = _get("run_id")
+    seq = _get("seq")
+    sv = _get("schema_version")
+    return Event(
+        id=r["id"],
+        task_id=r["task_id"],
+        kind=r["kind"],
+        payload=payload,
+        created_at=r["created_at"],
+        run_id=int(run_id) if run_id is not None else None,
+        seq=int(seq) if seq is not None else None,
+        event_id=_get("event_id"),
+        message_id=_get("message_id"),
+        schema_version=int(sv) if sv is not None else None,
+        actor=_get("actor"),
+        source=_get("source"),
+        transition=_get("transition"),
+        protocol=_get("protocol"),
+    )
+
+
 def list_events(conn: sqlite3.Connection, task_id: str) -> list[Event]:
     rows = conn.execute(
-        "SELECT * FROM task_events WHERE task_id = ? ORDER BY created_at ASC, id ASC",
+        """
+        SELECT * FROM task_events
+         WHERE task_id = ?
+         ORDER BY COALESCE(seq, 9223372036854775807) ASC, created_at ASC, id ASC
+        """,
         (task_id,),
     ).fetchall()
-    out = []
-    for r in rows:
-        try:
-            payload = json.loads(r["payload"]) if r["payload"] else None
-        except Exception:
-            payload = None
-        out.append(
-            Event(
-                id=r["id"],
-                task_id=r["task_id"],
-                kind=r["kind"],
-                payload=payload,
-                created_at=r["created_at"],
-                run_id=(int(r["run_id"]) if "run_id" in r.keys() and r["run_id"] is not None else None),
-            )
+    return [_row_to_event(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# Hermes Kanban Protocol v1 — append API + projection rebuild
+# ---------------------------------------------------------------------------
+
+
+class ExpectedSeqMismatch(Exception):
+    """Raised by :func:`append_event` when the compare-and-set fails.
+
+    Carries the task's actual ``current_seq`` so a caller that lost the CAS can
+    re-read the head and revalidate (allocate against the fresh seq) rather than
+    blindly retrying — the event it wanted to write may no longer be valid given
+    whatever the winner appended.
+    """
+
+    def __init__(self, task_id: str, expected_seq: int, current_seq: int):
+        self.task_id = task_id
+        self.expected_seq = expected_seq
+        self.current_seq = current_seq
+        super().__init__(
+            f"expected_seq {expected_seq} != current_seq {current_seq} "
+            f"for task {task_id}"
         )
-    return out
+
+
+class MessageIdConflict(Exception):
+    """Raised when a ``(task_id, message_id)`` is reused with different content.
+
+    A repeat with *identical* canonical content is an idempotent replay and
+    returns the existing event instead (see :func:`append_event`); only a
+    genuine content conflict raises.
+    """
+
+    def __init__(self, task_id: str, message_id: str):
+        self.task_id = task_id
+        self.message_id = message_id
+        super().__init__(
+            f"message_id {message_id!r} already used for task {task_id} "
+            f"with different content"
+        )
+
+
+@dataclass
+class AppendResult:
+    """Outcome of :func:`append_event`.
+
+    ``inserted`` is ``False`` only for an idempotent duplicate replay (the
+    returned ``event`` is the pre-existing row). ``current_seq`` is the task
+    head observed during the append transaction after applying or resolving the
+    command.
+    """
+
+    event: Event
+    inserted: bool
+    current_seq: int
+
+
+def _new_event_id() -> str:
+    """Generate a globally-unique protocol event id."""
+    return "evt_" + secrets.token_hex(8)
+
+
+def _canonical_event_content(
+    kind: str,
+    payload: Optional[dict],
+    transition: Optional[str],
+    schema_version: Optional[int],
+    protocol: Optional[str],
+    actor: Optional[str],
+    source: Optional[str],
+) -> str:
+    """Canonical JSON of an event's semantic content for idempotency checks.
+
+    Two events with the same ``(task_id, message_id)`` are an idempotent replay
+    iff their canonical content matches. Excludes seq/event_id/run_id/created_at
+    (allocation/identity/time metadata), which a retry need not reproduce.
+    """
+    return json.dumps(
+        {
+            "kind": kind,
+            "payload": payload,
+            "transition": transition,
+            "schema_version": schema_version,
+            "protocol": protocol,
+            "actor": actor,
+            "source": source,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+
+
+def append_event(
+    conn: sqlite3.Connection,
+    task_id: str,
+    kind: str,
+    payload: Optional[dict] = None,
+    *,
+    expected_seq: int,
+    message_id: str,
+    event_id: Optional[str] = None,
+    run_id: Optional[int] = None,
+    actor: Optional[str] = None,
+    source: Optional[str] = None,
+    transition: Optional[str] = None,
+    schema_version: int = 1,
+    protocol: str = "hermes-kanban/1",
+) -> AppendResult:
+    """Append a protocol v1 event with optimistic concurrency + idempotency.
+
+    Runs in a single ``write_txn`` (BEGIN IMMEDIATE), so concurrent appenders
+    serialize on SQLite's writer lock and the read-then-insert is atomic:
+
+    * **Idempotency** — if ``(task_id, message_id)`` already exists, an exact
+      content match returns that row with ``inserted=False``; a content
+      mismatch raises :class:`MessageIdConflict`.
+    * **Compare-and-set** — ``expected_seq`` must equal the task's current head
+      seq (0 when the task has no seq-bearing events yet). On mismatch this
+      raises :class:`ExpectedSeqMismatch` (carrying ``current_seq``) and writes
+      nothing. On success the event is allocated ``seq = current + 1``.
+
+    The idempotency check precedes the CAS so a retry of an already-applied
+    event is honoured even though the head has since advanced.
+    """
+    canonical = _canonical_event_content(
+        kind, payload, transition, schema_version, protocol, actor, source
+    )
+    with write_txn(conn):
+        head = conn.execute(
+            "SELECT MAX(seq) AS m FROM task_events WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+        current_seq = head["m"] if head and head["m"] is not None else 0
+        existing = conn.execute(
+            "SELECT * FROM task_events WHERE task_id = ? AND message_id = ?",
+            (task_id, message_id),
+        ).fetchone()
+        if existing is not None:
+            ex_payload = (
+                json.loads(existing["payload"]) if existing["payload"] else None
+            )
+            existing_canonical = _canonical_event_content(
+                existing["kind"],
+                ex_payload,
+                existing["transition"],
+                existing["schema_version"],
+                existing["protocol"],
+                existing["actor"],
+                existing["source"],
+            )
+            if existing_canonical == canonical:
+                return AppendResult(
+                    event=_row_to_event(existing), inserted=False, current_seq=current_seq
+                )
+            raise MessageIdConflict(task_id, message_id)
+
+        if expected_seq != current_seq:
+            # Raising inside write_txn triggers ROLLBACK — no row is written.
+            raise ExpectedSeqMismatch(task_id, expected_seq, current_seq)
+
+        new_seq = current_seq + 1
+        eid = event_id or _new_event_id()
+        now = int(time.time())
+        pl = json.dumps(payload, ensure_ascii=False) if payload else None
+        cur = conn.execute(
+            "INSERT INTO task_events ("
+            " task_id, run_id, kind, payload, created_at, "
+            " seq, event_id, message_id, schema_version, actor, source, "
+            " transition, protocol"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                task_id, run_id, kind, pl, now,
+                new_seq, eid, message_id, schema_version, actor, source,
+                transition, protocol,
+            ),
+        )
+        event = Event(
+            id=cur.lastrowid,
+            task_id=task_id,
+            kind=kind,
+            payload=payload,
+            created_at=now,
+            run_id=run_id,
+            seq=new_seq,
+            event_id=eid,
+            message_id=message_id,
+            schema_version=schema_version,
+            actor=actor,
+            source=source,
+            transition=transition,
+            protocol=protocol,
+        )
+    return AppendResult(event=event, inserted=True, current_seq=new_seq)
+
+
+def read_events_for_projection(
+    conn: sqlite3.Connection, task_id: str
+) -> list[Event]:
+    """Read a task's events in deterministic replay order for the projector.
+
+    Ordered by per-task ``seq`` when present, falling back to ``created_at, id``
+    for any pre-protocol row that has not yet been backfilled. This is the same
+    order ``list_events`` uses, so a rebuild matches a live read.
+    """
+    rows = conn.execute(
+        """
+        SELECT * FROM task_events
+         WHERE task_id = ?
+         ORDER BY COALESCE(seq, 9223372036854775807) ASC, created_at ASC, id ASC
+        """,
+        (task_id,),
+    ).fetchall()
+    return [_row_to_event(r) for r in rows]
+
+
+def rebuild_task_projection(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    persist: bool = True,
+) -> "kanban_projector.ProjectionResult":
+    """Replay a task's events through the pure projector.
+
+    Reads events in replay order, projects them, and (when ``persist``) writes
+    the projection snapshot and any poison-event quarantine rows idempotently.
+    It does **not** mutate the canonical ``tasks`` row in this slice — the
+    snapshot is read-only derived state.
+    """
+    events = read_events_for_projection(conn, task_id)
+    result = kanban_projector.project_events(task_id, events)
+    if persist:
+        state = result.state
+        now = int(time.time())
+        with write_txn(conn):
+            conn.execute(
+                "INSERT INTO task_event_projections ("
+                " task_id, status, last_seq, last_event_id, applied_count, "
+                " quarantined_count, state_hash, state_json, updated_at"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(task_id) DO UPDATE SET "
+                " status=excluded.status, last_seq=excluded.last_seq, "
+                " last_event_id=excluded.last_event_id, "
+                " applied_count=excluded.applied_count, "
+                " quarantined_count=excluded.quarantined_count, "
+                " state_hash=excluded.state_hash, state_json=excluded.state_json, "
+                " updated_at=excluded.updated_at",
+                (
+                    task_id,
+                    state.status,
+                    state.last_seq,
+                    state.last_event_id,
+                    state.applied_count,
+                    state.quarantined_count,
+                    state.state_hash,
+                    state.state_json(),
+                    now,
+                ),
+            )
+            for q in result.quarantined:
+                # Idempotent via the partial unique index on
+                # (task_id, event_row_id): a re-run inserts nothing new.
+                conn.execute(
+                    "INSERT OR IGNORE INTO task_event_quarantine ("
+                    " task_id, event_row_id, event_id, seq, kind, reason, created_at"
+                    ") VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        task_id,
+                        q.event_row_id,
+                        q.event_id,
+                        q.seq,
+                        q.kind,
+                        q.reason,
+                        now,
+                    ),
+                )
+    return result
 
 
 def _append_event(
@@ -2705,19 +3207,28 @@ def _append_event(
     *,
     run_id: Optional[int] = None,
 ) -> None:
-    """Record an event row.  Called from within an already-open txn.
+    """Record a legacy-compatible event row. Called inside an open txn.
 
-    ``run_id`` is optional: pass the current run id so UIs can group
-    events by attempt. For events that aren't scoped to a single run
-    (task created/edited/archived, dependency promotion) leave it None
-    and the row carries NULL.
+    Existing call sites still use this helper unchanged, but fresh events now
+    receive the same protocol substrate as migrated legacy events: per-task
+    ``seq``, readable ``legacy:<row-id>`` event_id, and schema_version=0.
     """
     now = int(time.time())
     pl = json.dumps(payload, ensure_ascii=False) if payload else None
+    head = conn.execute(
+        "SELECT MAX(seq) AS m FROM task_events WHERE task_id = ?",
+        (task_id,),
+    ).fetchone()
+    seq = (head["m"] if head and head["m"] is not None else 0) + 1
+    cur = conn.execute(
+        "INSERT INTO task_events ("
+        " task_id, run_id, kind, payload, created_at, seq, schema_version"
+        ") VALUES (?, ?, ?, ?, ?, ?, 0)",
+        (task_id, run_id, kind, pl, now, seq),
+    )
     conn.execute(
-        "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
-        "VALUES (?, ?, ?, ?, ?)",
-        (task_id, run_id, kind, pl, now),
+        "UPDATE task_events SET event_id = ? WHERE id = ?",
+        (f"legacy:{cur.lastrowid}", cur.lastrowid),
     )
 
 
@@ -4653,6 +5164,8 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
         conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
+        conn.execute("DELETE FROM task_event_projections WHERE task_id = ?", (task_id,))
+        conn.execute("DELETE FROM task_event_quarantine WHERE task_id = ?", (task_id,))
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         return cur.rowcount == 1
 
@@ -4676,6 +5189,8 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
         conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
+        conn.execute("DELETE FROM task_event_projections WHERE task_id = ?", (task_id,))
+        conn.execute("DELETE FROM task_event_quarantine WHERE task_id = ?", (task_id,))
     recompute_ready(conn)
     return True
 
@@ -7361,15 +7876,7 @@ def unseen_events_for_sub(
     out: list[Event] = []
     max_id = cursor
     for r in rows:
-        try:
-            payload = json.loads(r["payload"]) if r["payload"] else None
-        except Exception:
-            payload = None
-        out.append(Event(
-            id=r["id"], task_id=r["task_id"], kind=r["kind"],
-            payload=payload, created_at=r["created_at"],
-            run_id=(int(r["run_id"]) if "run_id" in r.keys() and r["run_id"] is not None else None),
-        ))
+        out.append(_row_to_event(r))
         max_id = max(max_id, int(r["id"]))
     return max_id, out
 

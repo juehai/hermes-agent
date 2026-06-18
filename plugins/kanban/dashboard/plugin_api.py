@@ -184,6 +184,14 @@ def _event_dict(event: kanban_db.Event) -> dict[str, Any]:
         "payload": event.payload,
         "created_at": event.created_at,
         "run_id": event.run_id,
+        "seq": event.seq,
+        "event_id": event.event_id,
+        "message_id": event.message_id,
+        "schema_version": event.schema_version,
+        "actor": event.actor,
+        "source": event.source,
+        "transition": event.transition,
+        "protocol": event.protocol,
     }
 
 

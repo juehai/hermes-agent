@@ -1483,6 +1483,14 @@ def _cmd_show(args: argparse.Namespace) -> int:
                     "payload": e.payload,
                     "created_at": e.created_at,
                     "run_id": e.run_id,
+                    "seq": e.seq,
+                    "event_id": e.event_id,
+                    "message_id": e.message_id,
+                    "schema_version": e.schema_version,
+                    "actor": e.actor,
+                    "source": e.source,
+                    "transition": e.transition,
+                    "protocol": e.protocol,
                 }
                 for e in events
             ],
